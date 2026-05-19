@@ -256,8 +256,6 @@ contextBridge.exposeInMainWorld('electron', {
     }) => ipcRenderer.invoke('cowork:session:exportText', options),
 
     // Subagent tracking
-    getSubTaskStatus: (sessionId?: string) =>
-      ipcRenderer.invoke('cowork:subTask:status', sessionId),
     getSubTaskHistory: (options: { parentSessionId: string; agentId: string; sessionKey?: string }) =>
       ipcRenderer.invoke('cowork:subTask:history', options),
     listSubagentSessions: (parentSessionId: string) =>

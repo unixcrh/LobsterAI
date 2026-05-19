@@ -51,10 +51,10 @@ const SubagentSessionDetail: React.FC<SubagentSessionDetailProps> = ({ subagent,
   const fetchStatus = useCallback(async () => {
     if (!subagent.parentSessionId) return;
     try {
-      const result = await window.electron?.cowork?.getSubTaskStatus(subagent.parentSessionId);
-      if (result?.success && result.statuses) {
-        const s = result.statuses[subagent.id];
-        if (s) setStatus(s);
+      const result = await window.electron?.cowork?.listSubagentSessions(subagent.parentSessionId);
+      if (result?.success && result.runs) {
+        const run = result.runs.find((r) => r.id === subagent.id);
+        if (run?.status) setStatus(run.status);
       }
     } catch { /* ignore */ }
   }, [subagent]);

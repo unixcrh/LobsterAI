@@ -60,7 +60,6 @@ import CoworkPromptInput, { type CoworkPromptInputRef } from './CoworkPromptInpu
 import DiffView, { extractDiffFromToolInput } from './DiffView';
 import ImagePreviewModal, { type ImagePreviewSource } from './ImagePreviewModal';
 import LazyRenderTurn, { clearHeightCache } from './LazyRenderTurn';
-import SubagentInlineView from './SubagentInlineView';
 interface CoworkSessionDetailProps {
   onManageSkills?: () => void;
   onContinue: (prompt: string, skillPrompt?: string, imageAttachments?: CoworkImageAttachment[]) => boolean | void | Promise<boolean | void>;
@@ -447,11 +446,6 @@ const isTodoWriteToolName = (toolName: string | undefined): boolean => {
 const isCronToolName = (toolName: string | undefined): boolean => {
   if (!toolName) return false;
   return normalizeToolName(toolName) === 'cron';
-};
-
-const isSessionsSpawnToolName = (toolName: string | undefined): boolean => {
-  if (!toolName) return false;
-  return normalizeToolName(toolName) === 'sessionsspawn';
 };
 
 const getCronToolSummary = (input: Record<string, unknown>): string | null => {
@@ -975,39 +969,7 @@ const ToolCallGroup: React.FC<{
   const showNoDetailError = isToolError && !hasToolResultText;
   const toolResultFallback = showNoDetailError ? i18nService.t('coworkToolNoErrorDetail') : '';
   const displayToolResult = hasToolResultText ? toolResultDisplay : toolResultFallback;
-  const isSessionsSpawn = isSessionsSpawnToolName(rawToolName);
-
-  // Extract subagent identifier — must match the priority used in the main process
-  // (openclawRuntimeAdapter.ts spawn phase): agentId → taskName → label → toolCallId
-  const spawnIdentifier = useMemo(() => {
-    if (!isSessionsSpawn) return '';
-    const input = toolInput as Record<string, unknown> | undefined;
-    if (typeof input?.agentId === 'string' && input.agentId) return input.agentId;
-    if (typeof input?.taskName === 'string' && input.taskName) return input.taskName;
-    if (typeof input?.label === 'string' && input.label) return input.label;
-    // Last resort: use toolCallId as unique identifier (matches main process fallback)
-    return typeof toolUse.metadata?.toolUseId === 'string' ? toolUse.metadata.toolUseId : '';
-  }, [isSessionsSpawn, toolInput, toolUse.metadata?.toolUseId]);
-
-  // Extract childSessionKey from tool result for direct history fetch
-  const spawnSessionKey = useMemo(() => {
-    if (!isSessionsSpawn || !toolResult) return undefined;
-    const resultText = typeof toolResult.content === 'string' ? toolResult.content
-      : typeof toolResult.metadata?.toolResult === 'string' ? toolResult.metadata.toolResult : '';
-    try {
-      const parsed = JSON.parse(resultText);
-      if (typeof parsed?.childSessionKey === 'string') return parsed.childSessionKey;
-    } catch { /* not JSON */ }
-    // Try to extract from raw text
-    const match = resultText.match(/(agent:[^\s,}"]+)/);
-    return match ? match[1] : undefined;
-  }, [isSessionsSpawn, toolResult]);
-
-  const spawnTask = isSessionsSpawn
-    ? (typeof (toolInput as Record<string, unknown> | undefined)?.task === 'string'
-      ? (toolInput as Record<string, unknown>).task as string : '')
-    : '';
-  const [isExpanded, setIsExpanded] = useState(isSessionsSpawn);
+  const [isExpanded, setIsExpanded] = useState(false);
   const resultLineCount = hasToolResultText ? getToolResultLineCount(toolResultDisplay) : 0;
   const toolResultSummary = isCronTool && hasToolResultText
     ? truncatePreview(toolResultDisplay.replace(/\s+/g, ' '))
@@ -1141,8 +1103,6 @@ const ToolCallGroup: React.FC<{
                 </div>
               )}
             </div>
-          ) : isSessionsSpawn && spawnIdentifier ? (
-            <SubagentInlineView agentId={spawnIdentifier} task={spawnTask} sessionKey={spawnSessionKey} />
           ) : (
             // Standard display for other tools with input/output labels
             <div className="space-y-2">

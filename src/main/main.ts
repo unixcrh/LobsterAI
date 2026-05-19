@@ -3584,12 +3584,6 @@ if (!gotTheLock) {
 
   // ── Subagent tracking IPC ──────────────────────────────────────────────
 
-  ipcMain.handle('cowork:subTask:status', async (_event, sessionId?: string) => {
-    if (!openClawRuntimeAdapter) return { success: true, statuses: {} };
-    const statuses = openClawRuntimeAdapter.getSubagentStatuses(sessionId);
-    return { success: true, statuses };
-  });
-
   ipcMain.handle('cowork:subTask:history', async (_event, options: {
     parentSessionId: string;
     agentId: string;

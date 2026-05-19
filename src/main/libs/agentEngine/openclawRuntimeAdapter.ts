@@ -5799,17 +5799,6 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
   // ── Subagent public API ───────────────────────────────────────────────
 
   /**
-   * Returns status map for all known subagents: agentId → 'running' | 'done'.
-   */
-  getSubagentStatuses(_sessionId?: string): Record<string, 'running' | 'done'> {
-    const result: Record<string, 'running' | 'done'> = {};
-    for (const [agentId, status] of this.subagentStatus) {
-      result[agentId] = status;
-    }
-    return result;
-  }
-
-  /**
    * Returns persisted subagent runs for a parent session.
    * Merges in-memory status with database records for real-time accuracy.
    */
