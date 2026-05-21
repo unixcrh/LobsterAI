@@ -4,12 +4,12 @@ import {
   DocumentArrowDownIcon,
   PhotoIcon,
 } from '@heroicons/react/24/outline';
-import React, { useCallback, useEffect, useLayoutEffect, useMemo,useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useDispatch, useSelector } from 'react-redux';
 
 import { getScheduledReminderDisplayText } from '../../../scheduledTask/reminderText';
-import { getArtifactTypeFromExtension, normalizeFilePathForDedup, parseCodeBlockArtifacts, parseFileLinksFromMessage, parseFilePathsFromText, parseToolArtifact, stripFileLinksFromText } from '../../services/artifactParser';
+import { getArtifactTypeFromExtension, normalizeFilePathForDedup, parseCodeBlockArtifacts, parseFileLinksFromMessage, parseFilePathsFromText, parseRemoteImageArtifactsFromText, parseToolArtifact, parseToolResultMediaArtifacts, stripFileLinksFromText } from '../../services/artifactParser';
 import { coworkService } from '../../services/cowork';
 import { i18nService } from '../../services/i18n';
 import { RootState } from '../../store';
@@ -35,6 +35,7 @@ import { setActiveSkillIds } from '../../store/slices/skillSlice';
 import type { Artifact } from '../../types/artifact';
 import { PREVIEWABLE_ARTIFACT_TYPES } from '../../types/artifact';
 import type { CoworkImageAttachment,CoworkMessage, CoworkMessageMetadata } from '../../types/cowork';
+import type { MediaAttachmentRef } from '../../types/mediaGeneration';
 import type { Skill } from '../../types/skill';
 import { formatMessageDateTime } from '../../utils/tokenFormat';
 import { parseUserMessageForDisplay } from '../../utils/userMessageDisplay';
@@ -52,9 +53,10 @@ import CoworkPromptInput, { type CoworkPromptInputRef } from './CoworkPromptInpu
 import DiffView, { extractDiffFromToolInput } from './DiffView';
 import ImagePreviewModal, { type ImagePreviewSource } from './ImagePreviewModal';
 import LazyRenderTurn, { clearHeightCache } from './LazyRenderTurn';
+import MediaPollingIndicator, { type MediaPollingGroup } from './MediaPollingIndicator';
 interface CoworkSessionDetailProps {
   onManageSkills?: () => void;
-  onContinue: (prompt: string, skillPrompt?: string, imageAttachments?: CoworkImageAttachment[]) => boolean | void | Promise<boolean | void>;
+  onContinue: (prompt: string, skillPrompt?: string, imageAttachments?: CoworkImageAttachment[], mediaReferences?: MediaAttachmentRef[]) => boolean | void | Promise<boolean | void>;
   onStop: () => void;
   isSidebarCollapsed?: boolean;
   onToggleSidebar?: () => void;
@@ -851,6 +853,101 @@ export const hasRenderableAssistantContent = (turn: ConversationTurn): boolean =
   getVisibleAssistantItems(turn.assistantItems).length > 0
 );
 
+const isMediaStatusPoll = (group: ToolGroupItem): boolean => {
+  const toolName = group.toolUse.metadata?.toolName;
+  if (!toolName) return false;
+  const normalized = normalizeToolName(toolName);
+  if (normalized !== 'lobstervideogenerate' && normalized !== 'lobsteraiimagegenerate') return false;
+  const input = group.toolUse.metadata?.toolInput as Record<string, unknown> | undefined;
+  return input?.action === 'status' && typeof input?.taskId === 'string';
+};
+
+const TERMINAL_MEDIA_STATUSES = new Set(['succeeded', 'failed', 'timeout', 'cancelled']);
+
+const extractMediaPollStatus = (poll: ToolGroupItem): string | null => {
+  const result = poll.toolResult;
+  if (!result) return null;
+  const text = result.content || (result.metadata?.toolResult as string) || '';
+  const match = text.match(/^Status:\s*(\S+)/m);
+  return match ? match[1] : null;
+};
+
+export type ConsolidatedItem = AssistantTurnItem | { type: 'media_polling_group'; group: MediaPollingGroup };
+
+const consolidateMediaPolling = (items: AssistantTurnItem[]): ConsolidatedItem[] => {
+  // Pass 1: collect all status poll indices grouped by taskId
+  const pollsByTaskId = new Map<string, { toolName: string; indices: number[] }>();
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    if (item.type === 'tool_group' && isMediaStatusPoll(item.group)) {
+      const toolName = item.group.toolUse.metadata!.toolName!;
+      const input = item.group.toolUse.metadata!.toolInput as Record<string, string>;
+      const taskId = input.taskId;
+      const entry = pollsByTaskId.get(taskId);
+      if (entry) {
+        entry.indices.push(i);
+      } else {
+        pollsByTaskId.set(taskId, { toolName, indices: [i] });
+      }
+    }
+  }
+
+  // For taskIds with only 1 poll, no consolidation needed
+  const skipIndices = new Set<number>();
+  const insertAfterIndex = new Map<number, MediaPollingGroup>();
+
+  for (const [taskId, { toolName, indices }] of pollsByTaskId) {
+    if (indices.length < 2) continue;
+    // Keep the first poll visible, consolidate the rest
+    const consolidatedPolls: ToolGroupItem[] = [];
+    for (let k = 1; k < indices.length; k++) {
+      skipIndices.add(indices[k]);
+      consolidatedPolls.push((items[indices[k]] as { type: 'tool_group'; group: ToolGroupItem }).group);
+    }
+    const lastIndex = indices[indices.length - 1];
+    const lastPoll = consolidatedPolls[consolidatedPolls.length - 1];
+    const lastStatus = extractMediaPollStatus(lastPoll);
+    let isComplete = lastStatus != null && TERMINAL_MEDIA_STATUSES.has(lastStatus);
+
+    if (!isComplete) {
+      const completionPattern = new RegExp(
+        `Task ID: ${taskId}[\\s\\S]*?generation (succeeded|failed|timed out|cancelled)`
+        + `|generation (succeeded|failed|timed out|cancelled)[\\s\\S]*?Task ID: ${taskId}`,
+        'i',
+      );
+      for (const item of items) {
+        if (item.type === 'system' || item.type === 'tool_result') {
+          if (completionPattern.test(item.message.content)) {
+            isComplete = true;
+            break;
+          }
+        }
+      }
+    }
+    insertAfterIndex.set(lastIndex, {
+      type: 'media_polling_group',
+      toolName,
+      taskId,
+      polls: consolidatedPolls,
+      isComplete,
+    });
+  }
+
+  // Pass 2: build result, skipping consolidated polls and inserting the indicator
+  const result: ConsolidatedItem[] = [];
+  for (let i = 0; i < items.length; i++) {
+    if (!skipIndices.has(i)) {
+      result.push(items[i]);
+    }
+    const group = insertAfterIndex.get(i);
+    if (group) {
+      result.push({ type: 'media_polling_group', group });
+    }
+  }
+
+  return result;
+};
+
 const getToolResultLineCount = (result: string): number => {
   if (!result) return 0;
   return result.split('\n').length;
@@ -1318,6 +1415,30 @@ export const UserMessageItem: React.FC<{
   );
 });
 
+const MediaImageInline: React.FC<{ artifacts: Artifact[] }> = ({ artifacts }) => {
+  const [expandedImage, setExpandedImage] = useState<ImagePreviewSource | null>(null);
+
+  return (
+    <div className="flex flex-wrap gap-2">
+      {artifacts.map(artifact => {
+        const src = artifact.filePath
+          ? `localfile://${artifact.filePath}`
+          : artifact.remoteUrl || artifact.content;
+        return (
+          <img
+            key={artifact.id}
+            src={src}
+            alt={artifact.title}
+            className="max-h-72 max-w-full rounded-lg object-contain cursor-pointer border border-border hover:border-primary transition-colors"
+            onClick={() => setExpandedImage({ src, alt: artifact.title })}
+          />
+        );
+      })}
+      <ImagePreviewModal image={expandedImage} onClose={() => setExpandedImage(null)} />
+    </div>
+  );
+};
+
 const AssistantMessageItem: React.FC<{
   message: CoworkMessage;
   resolveLocalFilePath?: (href: string, text: string) => string | null;
@@ -1493,6 +1614,10 @@ export const AssistantTurnBlock: React.FC<{
   showCopyButtons = true,
 }) => {
   const visibleAssistantItems = getVisibleAssistantItems(turn.assistantItems);
+  const consolidatedItems = useMemo(
+    () => consolidateMediaPolling(visibleAssistantItems),
+    [visibleAssistantItems],
+  );
 
   const renderSystemMessage = (message: CoworkMessage) => {
     const isError = !hasText(message.content) && typeof message.metadata?.error === 'string';
@@ -1575,7 +1700,19 @@ export const AssistantTurnBlock: React.FC<{
       <div className={COWORK_DETAIL_CONTENT_CLASS}>
         <div className="flex items-start gap-3">
           <div className="flex-1 min-w-0 py-3 space-y-3">
-            {visibleAssistantItems.map((item, index) => {
+            {consolidatedItems.map((item, index) => {
+              if (item.type === 'media_polling_group') {
+                const nextItem = consolidatedItems[index + 1];
+                const isLastInSequence = !nextItem || (nextItem.type !== 'tool_group' && nextItem.type !== 'media_polling_group');
+                return (
+                  <MediaPollingIndicator
+                    key={`media-poll-${item.group.taskId}-${item.group.polls[0].toolUse.id}`}
+                    group={item.group}
+                    isLastInSequence={isLastInSequence}
+                  />
+                );
+              }
+
               if (item.type === 'assistant') {
                 if (item.message.metadata?.isThinking) {
                   return (
@@ -1586,10 +1723,21 @@ export const AssistantTurnBlock: React.FC<{
                     />
                   );
                 }
+
+                // When the AI outputs bare "MEDIA" text, render turn image artifacts inline
+                if (item.message.content?.trim() === 'MEDIA' && artifacts && artifacts.length > 0) {
+                  const imageArtifacts = artifacts.filter(a => a.type === 'image' && (a.filePath || a.remoteUrl || a.content));
+                  if (imageArtifacts.length > 0) {
+                    return (
+                      <MediaImageInline key={item.message.id} artifacts={imageArtifacts} />
+                    );
+                  }
+                }
+
                 // Check if there are any tool_group items after this assistant message
-                const hasToolGroupAfter = visibleAssistantItems
+                const hasToolGroupAfter = consolidatedItems
                   .slice(index + 1)
-                  .some(laterItem => laterItem.type === 'tool_group');
+                  .some(laterItem => laterItem.type === 'tool_group' || laterItem.type === 'media_polling_group');
                 const isLastAssistant = showCopyButtons && !hasToolGroupAfter;
 
                 return (
@@ -1605,8 +1753,8 @@ export const AssistantTurnBlock: React.FC<{
               }
 
               if (item.type === 'tool_group') {
-                const nextItem = visibleAssistantItems[index + 1];
-                const isLastInSequence = !nextItem || nextItem.type !== 'tool_group';
+                const nextItem = consolidatedItems[index + 1];
+                const isLastInSequence = !nextItem || (nextItem.type !== 'tool_group' && nextItem.type !== 'media_polling_group');
                 return (
                   <ToolCallGroup
                     key={`tool-${item.group.toolUse.id}`}
@@ -1830,6 +1978,8 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
               detected.push(pa);
             }
           }
+
+          detected.push(...parseRemoteImageArtifactsFromText(msg.content, msg.id, sessionId, 'artifact-remote-assistant'));
         }
 
         if (msg.type === 'tool_result' && msg.content) {
@@ -1841,6 +1991,32 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
               detected.push(pa);
             }
           }
+          detected.push(...parseRemoteImageArtifactsFromText(msg.content, msg.id, sessionId, 'artifact-remote-toolresult'));
+          detected.push(...parseToolResultMediaArtifacts(msg, sessionId));
+        }
+
+        if (msg.type === 'system' && msg.content) {
+          const fileLinks = parseFileLinksFromMessage(msg.content, msg.id, sessionId);
+          for (const fl of fileLinks) {
+            const normalized = fl.filePath ? normalizeFilePathForDedup(fl.filePath) : '';
+            if (fl.filePath && !seenFilePaths.has(normalized)) {
+              seenFilePaths.add(normalized);
+              detected.push(fl);
+            }
+          }
+
+          const contentWithoutFileLinks = stripFileLinksFromText(msg.content);
+          const pathArtifacts = parseFilePathsFromText(contentWithoutFileLinks, msg.id, sessionId, 'artifact-system-path');
+          for (const pa of pathArtifacts) {
+            const normalized = pa.filePath ? normalizeFilePathForDedup(pa.filePath) : '';
+            if (pa.filePath && !seenFilePaths.has(normalized)) {
+              seenFilePaths.add(normalized);
+              detected.push(pa);
+            }
+          }
+
+          detected.push(...parseRemoteImageArtifactsFromText(msg.content, msg.id, sessionId, 'artifact-remote-system'));
+          detected.push(...parseToolResultMediaArtifacts(msg, sessionId));
         }
       }
 

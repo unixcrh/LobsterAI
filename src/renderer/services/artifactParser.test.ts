@@ -1,6 +1,12 @@
 import { describe, expect, test } from 'vitest';
 
-import { normalizeFilePathForDedup, parseFileLinksFromMessage, parseFilePathsFromText, parseToolArtifact } from './artifactParser';
+import {
+  normalizeFilePathForDedup,
+  parseFileLinksFromMessage,
+  parseFilePathsFromText,
+  parseToolArtifact,
+  parseToolResultMediaArtifacts,
+} from './artifactParser';
 
 describe('normalizeFilePathForDedup', () => {
   test('strips leading / before Windows drive letter', () => {
@@ -47,6 +53,14 @@ describe('parseFileLinksFromMessage', () => {
     expect(artifacts).toHaveLength(1);
     expect(artifacts[0].filePath).toBe('D:/my folder/文件.pptx');
   });
+
+  test('creates image artifacts for local file links', () => {
+    const content = '[generated-image.png](file:///home/user/project/generated-image.png)';
+    const artifacts = parseFileLinksFromMessage(content, 'msg1', 'sess1');
+    expect(artifacts).toHaveLength(1);
+    expect(artifacts[0].type).toBe('image');
+    expect(artifacts[0].filePath).toBe('/home/user/project/generated-image.png');
+  });
 });
 
 describe('parseFilePathsFromText', () => {
@@ -55,6 +69,67 @@ describe('parseFilePathsFromText', () => {
     const artifacts = parseFilePathsFromText(content, 'msg1', 'sess1');
     expect(artifacts).toHaveLength(1);
     expect(artifacts[0].filePath).toBe('D:/project/output.pdf');
+  });
+
+  test('creates image artifacts for bare local image paths', () => {
+    const content = 'Saved generated image: /home/user/project/generated-image.webp';
+    const artifacts = parseFilePathsFromText(content, 'msg1', 'sess1');
+    expect(artifacts).toHaveLength(1);
+    expect(artifacts[0].type).toBe('image');
+    expect(artifacts[0].filePath).toBe('/home/user/project/generated-image.webp');
+  });
+});
+
+describe('parseToolResultMediaArtifacts', () => {
+  test('prefers local filePath for persisted generated images', () => {
+    const toolResultMsg = {
+      id: 'result1',
+      type: 'system' as const,
+      content: 'Saved generated image',
+      timestamp: Date.now(),
+      metadata: {
+        toolResultDetails: {
+          assets: [
+            {
+              type: 'image',
+              url: 'https://example.com/generated.png?signature=temporary',
+              filePath: '/home/user/project/generated-image.png',
+              mimeType: 'image/png',
+              filename: 'generated-image.png',
+            },
+          ],
+        },
+      },
+    };
+    const artifacts = parseToolResultMediaArtifacts(toolResultMsg, 'sess1');
+    expect(artifacts).toHaveLength(1);
+    expect(artifacts[0].type).toBe('image');
+    expect(artifacts[0].content).toBe('');
+    expect(artifacts[0].filePath).toBe('/home/user/project/generated-image.png');
+  });
+
+  test('uses remote url when no local file path exists', () => {
+    const toolResultMsg = {
+      id: 'result1',
+      type: 'tool_result' as const,
+      content: 'Generated image',
+      timestamp: Date.now(),
+      metadata: {
+        toolResultDetails: {
+          assets: [
+            {
+              type: 'image',
+              url: 'https://example.com/generated.png?signature=temporary',
+              mimeType: 'image/png',
+            },
+          ],
+        },
+      },
+    };
+    const artifacts = parseToolResultMediaArtifacts(toolResultMsg, 'sess1');
+    expect(artifacts).toHaveLength(1);
+    expect(artifacts[0].content).toBe('https://example.com/generated.png?signature=temporary');
+    expect(artifacts[0].filePath).toBeUndefined();
   });
 });
 

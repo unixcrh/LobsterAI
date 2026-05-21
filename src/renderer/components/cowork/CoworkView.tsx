@@ -17,6 +17,7 @@ import { addMessage, clearCurrentSession, setCurrentSession, setStreaming, updat
 import { clearSelection,selectAction, setActions } from '../../store/slices/quickActionSlice';
 import { clearActiveSkills, setActiveSkillIds } from '../../store/slices/skillSlice';
 import type { CoworkImageAttachment, CoworkSession, OpenClawEngineStatus } from '../../types/cowork';
+import type { MediaAttachmentRef } from '../../types/mediaGeneration';
 import { toOpenClawModelRef } from '../../utils/openclawModelRef';
 import ComposeIcon from '../icons/ComposeIcon';
 import SidebarToggleIcon from '../icons/SidebarToggleIcon';
@@ -68,6 +69,10 @@ const CoworkView: React.FC<CoworkViewProps> = ({ onRequestAppSettings, onShowSki
   const currentAgent = agents.find((agent) => agent.id === currentAgentId);
   const currentAgentWorkingDirectory = currentAgent?.workingDirectory?.trim() || config.workingDirectory || '';
   const currentAgentSelectedModel = useAgentSelectedModel(currentAgentId, currentAgent?.model ?? '');
+  const mediaSelection = useSelector((state: RootState) => {
+    const key = currentSession?.id || '__home__';
+    return state.cowork.mediaSelection[key];
+  });
 
   const buildApiConfigNotice = (error?: string): { noticeI18nKey: string; noticeExtra?: string } => {
     const key = 'coworkModelSettingsRequired';
@@ -285,6 +290,7 @@ const CoworkView: React.FC<CoworkViewProps> = ({ onRequestAppSettings, onShowSki
         agentId: currentAgentId,
         modelOverride: sessionModelOverride,
         imageAttachments,
+        mediaSelection: mediaSelection && mediaSelection.mode !== 'none' ? mediaSelection : undefined,
       });
 
       if (!startedSession && startError) {
@@ -317,7 +323,7 @@ const CoworkView: React.FC<CoworkViewProps> = ({ onRequestAppSettings, onShowSki
     }
   };
 
-  const handleContinueSession = async (prompt: string, skillPrompt?: string, imageAttachments?: CoworkImageAttachment[]) => {
+  const handleContinueSession = async (prompt: string, skillPrompt?: string, imageAttachments?: CoworkImageAttachment[], mediaReferences?: MediaAttachmentRef[]) => {
     if (!currentSession) return;
     // Prevent duplicate submissions
     if (isContinuingRef.current) return;
@@ -355,6 +361,8 @@ const CoworkView: React.FC<CoworkViewProps> = ({ onRequestAppSettings, onShowSki
         systemPrompt: combinedSystemPrompt,
         activeSkillIds: sessionSkillIds.length > 0 ? sessionSkillIds : undefined,
         imageAttachments,
+        mediaSelection: mediaSelection && mediaSelection.mode !== 'none' ? mediaSelection : undefined,
+        mediaReferences,
       });
     } finally {
       isContinuingRef.current = false;

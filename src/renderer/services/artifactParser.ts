@@ -34,6 +34,8 @@ const EXTENSION_TO_ARTIFACT_TYPE: Record<string, ArtifactType> = {
   '.jpeg': 'image',
   '.gif': 'image',
   '.webp': 'image',
+  '.bmp': 'image',
+  '.avif': 'image',
   '.mermaid': 'mermaid',
   '.mmd': 'mermaid',
   '.jsx': 'code',
@@ -51,7 +53,7 @@ const EXTENSION_TO_ARTIFACT_TYPE: Record<string, ArtifactType> = {
   '.pdf': 'document',
 };
 
-const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp']);
+const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.avif']);
 const BINARY_DOCUMENT_EXTENSIONS = new Set(['.docx', '.xlsx', '.pptx', '.pdf']);
 
 export function getArtifactTypeFromLanguage(lang: string): ArtifactType | null {
@@ -116,12 +118,14 @@ export function parseCodeBlockArtifacts(
 }
 
 const FILE_LINK_RE = /\[([^\]]+)\]\(file:\/\/([^)]+)\)/g;
+const REMOTE_MARKDOWN_IMAGE_RE = /!\[([^\]]*)\]\((https?:\/\/[^)\s]+)\)/g;
+const REMOTE_IMAGE_URL_RE = /(?:^|[\s<("'`])(https?:\/\/[^\s<>"'`)]*\.(?:png|jpe?g|gif|webp|bmp|avif)(?:\?[^\s<>"'`)]*)?)(?:[\s>)"'`]|$)/gi;
 
 export function stripFileLinksFromText(text: string): string {
   return text.replace(/\[([^\]]+)\]\(file:\/\/([^)]+)\)/g, '');
 }
 
-const BARE_FILE_PATH_RE = /(?:^|[\s"'`(])(\/?(?:[^\s"'`()\[\]]+\/)*[^\s"'`()\[\]]+\.(?:docx|xlsx|pptx|pdf|md|txt|log|csv))(?:[\s"'`)]|$)/gm;
+const BARE_FILE_PATH_RE = /(?:^|[\s"'`(])(\/?(?:[^\s"'`()\[\]]+\/)*[^\s"'`()\[\]]+\.(?:png|jpe?g|gif|webp|bmp|avif|docx|xlsx|pptx|pdf|md|txt|log|csv))(?:[\s"'`)]|$)/gm;
 
 export function parseFilePathsFromText(
   messageContent: string,
@@ -221,6 +225,103 @@ export function parseFileLinksFromMessage(
     });
 
     index++;
+  }
+
+  return artifacts;
+}
+
+export function parseRemoteImageArtifactsFromText(
+  messageContent: string,
+  messageId: string,
+  sessionId: string,
+  idPrefix = 'artifact-remote-image',
+): Artifact[] {
+  if (!messageContent) return [];
+
+  const artifacts: Artifact[] = [];
+  const seen = new Set<string>();
+  let index = 0;
+
+  const pushImage = (url: string, title?: string) => {
+    const trimmedUrl = url.trim();
+    if (!trimmedUrl || seen.has(trimmedUrl)) return;
+    seen.add(trimmedUrl);
+    artifacts.push({
+      id: `${idPrefix}-${messageId}-${index++}`,
+      messageId,
+      sessionId,
+      type: 'image',
+      title: title?.trim() || `Generated image ${index}`,
+      content: trimmedUrl,
+      fileName: title?.trim() || `generated-image-${index}`,
+      source: 'tool',
+      createdAt: Date.now(),
+    });
+  };
+
+  const markdownRe = new RegExp(REMOTE_MARKDOWN_IMAGE_RE.source, 'g');
+  let markdownMatch: RegExpExecArray | null;
+  while ((markdownMatch = markdownRe.exec(messageContent)) !== null) {
+    pushImage(markdownMatch[2], markdownMatch[1]);
+  }
+
+  const bareUrlRe = new RegExp(REMOTE_IMAGE_URL_RE.source, 'gi');
+  let urlMatch: RegExpExecArray | null;
+  while ((urlMatch = bareUrlRe.exec(messageContent)) !== null) {
+    pushImage(urlMatch[1]);
+  }
+
+  return artifacts;
+}
+
+export function parseToolResultMediaArtifacts(
+  toolResultMsg: CoworkMessage | undefined,
+  sessionId: string,
+): Artifact[] {
+  if (!toolResultMsg?.metadata || toolResultMsg.metadata.isError) return [];
+
+  const details = toolResultMsg.metadata.toolResultDetails;
+  if (!details || typeof details !== 'object' || Array.isArray(details)) return [];
+
+  const assets = (details as Record<string, unknown>).assets;
+  if (!Array.isArray(assets)) return [];
+
+  const artifacts: Artifact[] = [];
+  for (let index = 0; index < assets.length; index++) {
+    const asset = assets[index];
+    if (!asset || typeof asset !== 'object' || Array.isArray(asset)) continue;
+    const item = asset as Record<string, unknown>;
+    if (item.type !== 'image') continue;
+
+    const url = typeof item.url === 'string' && item.url.trim()
+      ? item.url.trim()
+      : '';
+    const filePath = typeof item.filePath === 'string' && item.filePath.trim()
+      ? item.filePath.trim()
+      : typeof item.localPath === 'string' && item.localPath.trim()
+        ? item.localPath.trim()
+        : '';
+    if (!url && !filePath) continue;
+
+    const filename = typeof item.filename === 'string' && item.filename.trim()
+      ? item.filename.trim()
+      : filePath
+        ? getFileName(filePath)
+        : `generated-image-${index + 1}`;
+
+    artifacts.push({
+      id: `artifact-media-${toolResultMsg.id}-${index}`,
+      messageId: toolResultMsg.id,
+      sessionId,
+      type: 'image',
+      title: filename,
+      content: filePath ? '' : url,
+      fileName: filename,
+      ...(filePath ? { filePath } : {}),
+      ...(filePath && url ? { remoteUrl: url } : {}),
+      source: 'tool',
+      createdAt: toolResultMsg.timestamp || Date.now(),
+    });
   }
 
   return artifacts;

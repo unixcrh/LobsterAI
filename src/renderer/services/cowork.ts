@@ -344,6 +344,8 @@ class CoworkService {
       systemPrompt: options.systemPrompt,
       activeSkillIds: options.activeSkillIds,
       imageAttachments: options.imageAttachments,
+      mediaSelection: options.mediaSelection,
+      mediaReferences: options.mediaReferences,
     });
     if (!result.success) {
       store.dispatch(setStreaming(false));

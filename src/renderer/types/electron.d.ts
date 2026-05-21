@@ -421,6 +421,7 @@ interface IElectronAPI {
       activeSkillIds?: string[];
       agentId?: string;
       imageAttachments?: Array<{ name: string; mimeType: string; base64Data: string }>;
+      mediaSelection?: { mode: string; modelId?: string; modelName?: string };
     }) => Promise<{
       success: boolean;
       session?: CoworkSession;
@@ -434,6 +435,8 @@ interface IElectronAPI {
       systemPrompt?: string;
       activeSkillIds?: string[];
       imageAttachments?: Array<{ name: string; mimeType: string; base64Data: string }>;
+      mediaSelection?: { mode: string; modelId?: string; modelName?: string };
+      mediaReferences?: Array<{ token: string; mediaType: string; index: number; fileId: string; fileName: string; mimeType: string; localPath?: string; remoteUrl?: string; role?: string }>;
     }) => Promise<{
       success: boolean;
       session?: CoworkSession;
@@ -877,6 +880,10 @@ interface IElectronAPI {
     getProfileSummary: () => Promise<{ success: boolean; data?: ProfileSummaryData }>;
     onCallback: (callback: (data: { code: string }) => void) => () => void;
     onQuotaChanged: (callback: () => void) => () => void;
+  };
+  media: {
+    getModels: (type: 'image' | 'video') => Promise<{ success: boolean; models?: Array<{ modelId: string; displayName: string; provider: string; mediaType: string; generationTimeout: number; pricing: Record<string, unknown> }>; error?: string }>;
+    getTaskStatus: (taskId: number, type: 'image' | 'video') => Promise<{ success: boolean; task?: Record<string, unknown>; error?: string }>;
   };
   enterprise: {
     getConfig: () => Promise<{

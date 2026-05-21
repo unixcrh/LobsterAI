@@ -54,6 +54,7 @@ import { isSystemProxyEnabled } from './systemProxy';
 export type McpBridgeConfig = {
   callbackUrl: string;
   askUserCallbackUrl: string;
+  mediaCallbackUrl: string;
   secret: string;
   tools: McpToolManifestEntry[];
 };
@@ -952,6 +953,7 @@ type OpenClawConfigSyncDeps = {
   getMcpBridgeSecret?: () => string;
   getSkillsList?: () => Array<{ id: string; enabled: boolean }>;
   getAgents?: () => Agent[];
+  getSubscriptionStatus?: () => string;
 };
 
 export class OpenClawConfigSync {
@@ -975,6 +977,7 @@ export class OpenClawConfigSync {
   private readonly getMcpBridgeSecret?: () => string;
   private readonly getSkillsList?: () => Array<{ id: string; enabled: boolean }>;
   private readonly getAgents?: () => Agent[];
+  private readonly getSubscriptionStatus: () => string;
   private previousBindingsJson?: string;
   private currentBindingsObj: { bindings?: Array<Record<string, unknown>> } = {};
 
@@ -999,6 +1002,7 @@ export class OpenClawConfigSync {
     this.getMcpBridgeSecret = deps.getMcpBridgeSecret;
     this.getSkillsList = deps.getSkillsList;
     this.getAgents = deps.getAgents;
+    this.getSubscriptionStatus = deps.getSubscriptionStatus ?? (() => 'free');
   }
 
   /**
@@ -1192,6 +1196,7 @@ export class OpenClawConfigSync {
     );
     const hasMcpBridgePlugin = isBundledPluginAvailable('mcp-bridge');
     const hasAskUserPlugin = isBundledPluginAvailable('ask-user-question');
+    const hasMediaGenPlugin = isBundledPluginAvailable('lobster-media-generation');
     const qwenPortalAuthPluginId = resolveOpenClawExtensionPluginId('qwen-portal-auth');
 
     // Detect if any provider uses Qwen/Aliyun DashScope URLs — OpenClaw auto-injects
@@ -1251,6 +1256,8 @@ export class OpenClawConfigSync {
     const bindingsChanged = this.previousBindingsJson !== undefined
       && bindingsJson !== this.previousBindingsJson;
     this.previousBindingsJson = bindingsJson;
+
+    const isSubscribed = this.getSubscriptionStatus() === 'active';
 
     const managedConfig: Record<string, unknown> = {
       gateway: {
@@ -1324,7 +1331,10 @@ export class OpenClawConfigSync {
         ownerAllowFrom: MANAGED_OWNER_ALLOW_FROM,
       },
       tools: {
-        deny: [...MANAGED_TOOL_DENY],
+        deny: [
+          ...MANAGED_TOOL_DENY,
+          ...(isSubscribed ? ['image_generate', 'video_generate'] : []),
+        ],
         web: {
           search: {
             enabled: false,
@@ -1410,6 +1420,7 @@ export class OpenClawConfigSync {
             : {}),
           ...(hasMcpBridgePlugin ? { 'mcp-bridge': { enabled: true } } : {}),
           ...(hasAskUserPlugin ? { 'ask-user-question': { enabled: true } } : {}),
+          ...(hasMediaGenPlugin ? { 'lobster-media-generation': { enabled: isSubscribed } } : {}),
           // Some OpenClaw versions auto-inject qwen-portal-auth for
           // Qwen/DashScope URLs. Declare it only when the plugin actually
           // exists, otherwise it becomes a stale entry on every startup.
@@ -1478,6 +1489,20 @@ export class OpenClawConfigSync {
         config: {
           callbackUrl: mcpBridgeCfg.askUserCallbackUrl,
           secret: '${LOBSTER_MCP_BRIDGE_SECRET}',
+        },
+      };
+    }
+
+    // Sync LobsterMediaGeneration plugin config — uses media callback endpoint
+    if (hasMediaGenPlugin && isSubscribed && mcpBridgeCfg && managedConfig.plugins) {
+      const plugins = managedConfig.plugins as Record<string, unknown>;
+      const entries = plugins.entries as Record<string, Record<string, unknown>>;
+      entries['lobster-media-generation'] = {
+        enabled: true,
+        config: {
+          callbackUrl: mcpBridgeCfg.mediaCallbackUrl,
+          secret: '${LOBSTER_MCP_BRIDGE_SECRET}',
+          requestTimeoutMs: 120000,
         },
       };
     }

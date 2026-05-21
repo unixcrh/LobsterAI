@@ -1,0 +1,363 @@
+import Lottie from 'lottie-react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { useDispatch, useSelector } from 'react-redux';
+import { CheckIcon } from '@heroicons/react/24/outline';
+
+import mediaGenIconLight from '../icons/MediaGenIcon-light.svg';
+import mediaGenIconDark from '../icons/MediaGenIcon-dark.svg';
+import mediaGenAnimation from '../icons/MediaGenIcon.json';
+import { getProviderIcon } from '../../providers/uiRegistry';
+import { authService } from '../../services/auth';
+import { i18nService } from '../../services/i18n';
+import { localStore } from '../../services/store';
+import { RootState } from '../../store';
+import { setMediaModels, setMediaSelection } from '../../store/slices/coworkSlice';
+import type { MediaGenerationMode, MediaModel } from '../../types/mediaGeneration';
+
+interface SavedMediaSelection {
+  image?: { modelId: string; modelName: string };
+  video?: { modelId: string; modelName: string };
+}
+
+const MEDIA_SELECTION_KV_KEY = 'media_selection';
+
+const MEDIA_ICON_HINTS: Array<{ pattern: RegExp; providerKey: string }> = [
+  { pattern: /doubao|seedream|豆包/i, providerKey: 'doubao' },
+  { pattern: /minimax/i, providerKey: 'minimax' },
+  { pattern: /qwen|qwq|wan2\.7|z-image/i, providerKey: 'qwen' },
+];
+
+const resolveMediaModelIcon = (model: MediaModel): React.ReactNode => {
+  const text = `${model.displayName} ${model.modelId}`;
+  const hint = MEDIA_ICON_HINTS.find(({ pattern }) => pattern.test(text));
+  return getProviderIcon(hint?.providerKey ?? '');
+};
+
+interface MediaModelPickerProps {
+  draftKey: string;
+  disabled?: boolean;
+}
+
+const MediaModelPicker: React.FC<MediaModelPickerProps> = ({ draftKey, disabled }) => {
+  const dispatch = useDispatch();
+  const [isOpen, setIsOpen] = useState(false);
+  const [activeTab, setActiveTab] = useState<'image' | 'video'>('image');
+  const [isLoading, setIsLoading] = useState(false);
+  const dropdownRef = useRef<HTMLDivElement>(null);
+  const buttonRef = useRef<HTMLButtonElement>(null);
+
+  const isLoggedIn = useSelector((state: RootState) => state.auth.isLoggedIn);
+  const authQuota = useSelector((state: RootState) => state.auth.quota);
+  const isSubscribed = isLoggedIn && authQuota?.subscriptionStatus === 'active';
+
+  const mediaModels = useSelector((state: RootState) => state.cowork.mediaModels);
+  const selection = useSelector((state: RootState) => state.cowork.mediaSelection[draftKey]);
+
+  const fetchModels = useCallback(async () => {
+    setIsLoading(true);
+    try {
+      const [imageResult, videoResult] = await Promise.all([
+        window.electron.media.getModels('image'),
+        window.electron.media.getModels('video'),
+      ]);
+      console.log('[MediaModelPicker] fetchModels results:', {
+        image: { success: imageResult.success, count: imageResult.models?.length, error: imageResult.error },
+        video: { success: videoResult.success, count: videoResult.models?.length, error: videoResult.error },
+      });
+      if (!imageResult.success) console.warn('[MediaModelPicker] image models fetch failed:', imageResult.error);
+      if (!videoResult.success) console.warn('[MediaModelPicker] video models fetch failed:', videoResult.error);
+      dispatch(setMediaModels({
+        image: (imageResult.models || []) as MediaModel[],
+        video: (videoResult.models || []) as MediaModel[],
+      }));
+      const imageModels = (imageResult.models || []) as MediaModel[];
+      const videoModels = (videoResult.models || []) as MediaModel[];
+      if (!selection || selection.mode === 'none') {
+        const saved = await localStore.getItem<SavedMediaSelection>(MEDIA_SELECTION_KV_KEY);
+        const imageEntry = saved?.image;
+        const videoEntry = saved?.video;
+        if (imageEntry && imageModels.some(m => m.modelId === imageEntry.modelId)) {
+          dispatch(setMediaSelection({
+            draftKey,
+            selection: { mode: 'image', modelId: imageEntry.modelId, modelName: imageEntry.modelName },
+          }));
+        } else if (videoEntry && videoModels.some(m => m.modelId === videoEntry.modelId)) {
+          dispatch(setMediaSelection({
+            draftKey,
+            selection: { mode: 'video', modelId: videoEntry.modelId, modelName: videoEntry.modelName },
+          }));
+          setActiveTab('video');
+        } else if (imageModels.length > 0) {
+          const fallback = { modelId: imageModels[0].modelId, modelName: imageModels[0].displayName };
+          dispatch(setMediaSelection({ draftKey, selection: { mode: 'image', ...fallback } }));
+          localStore.setItem(MEDIA_SELECTION_KV_KEY, { ...saved, image: fallback });
+        }
+      }
+    } catch (err) {
+      console.error('[MediaModelPicker] Failed to fetch models:', err);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [dispatch, draftKey, selection]);
+
+  useEffect(() => {
+    console.log('[MediaModelPicker] useEffect check:', {
+      isOpen, isLoggedIn, subscriptionStatus: authQuota?.subscriptionStatus, isSubscribed,
+      imageCount: mediaModels.image.length, videoCount: mediaModels.video.length,
+    });
+    if (isOpen && isSubscribed) {
+      fetchModels();
+    }
+  }, [isOpen, isSubscribed, fetchModels]);
+
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node) &&
+          buttonRef.current && !buttonRef.current.contains(e.target as Node)) {
+        setIsOpen(false);
+      }
+    };
+    if (isOpen) {
+      document.addEventListener('mousedown', handleClickOutside);
+      return () => document.removeEventListener('mousedown', handleClickOutside);
+    }
+  }, [isOpen]);
+
+  useEffect(() => {
+    if (selection && selection.mode !== 'none') return;
+
+    let cancelled = false;
+    (async () => {
+      const saved = await localStore.getItem<SavedMediaSelection>(MEDIA_SELECTION_KV_KEY);
+      if (cancelled) return;
+      const imageEntry = saved?.image;
+      const videoEntry = saved?.video;
+      if (imageEntry) {
+        dispatch(setMediaSelection({
+          draftKey,
+          selection: { mode: 'image', modelId: imageEntry.modelId, modelName: imageEntry.modelName },
+        }));
+      } else if (videoEntry) {
+        dispatch(setMediaSelection({
+          draftKey,
+          selection: { mode: 'video', modelId: videoEntry.modelId, modelName: videoEntry.modelName },
+        }));
+        setActiveTab('video');
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [draftKey, dispatch, selection]);
+
+  const handleSelect = async (mode: MediaGenerationMode, model?: MediaModel) => {
+    const isDeselect = model && selection?.modelId === model.modelId;
+    if (isDeselect) {
+      dispatch(setMediaSelection({ draftKey, selection: { mode: 'none' } }));
+    } else {
+      dispatch(setMediaSelection({
+        draftKey,
+        selection: { mode, modelId: model?.modelId, modelName: model?.displayName },
+      }));
+    }
+    const saved = await localStore.getItem<SavedMediaSelection>(MEDIA_SELECTION_KV_KEY) || {};
+    if (isDeselect) {
+      delete saved[mode as 'image' | 'video'];
+    } else if (model) {
+      saved[mode as 'image' | 'video'] = { modelId: model.modelId, modelName: model.displayName };
+    }
+    localStore.setItem(MEDIA_SELECTION_KV_KEY, saved);
+  };
+
+  const handleLogin = async () => {
+    setIsOpen(false);
+    await authService.login();
+  };
+
+  const handleSubscribe = async () => {
+    setIsOpen(false);
+    const { getPortalPricingUrl } = await import('../../services/endpoints');
+    await window.electron.shell.openExternal(getPortalPricingUrl());
+  };
+
+  const currentModels = activeTab === 'image' ? mediaModels.image : mediaModels.video;
+
+  const isMediaActive = selection != null && selection.mode !== 'none';
+
+  const triggerIcon = (
+    <>
+      <img src={mediaGenIconLight} alt="" className="h-7 w-7 dark:hidden" style={{ opacity: isMediaActive ? 1 : 0.5 }} />
+      <img src={mediaGenIconDark} alt="" className="h-7 w-7 hidden dark:block" style={{ opacity: isMediaActive ? 1 : 0.5 }} />
+    </>
+  );
+
+  const renderPromptPanel = (title: string, desc: string, btnLabel: string, onBtn: () => void, secondaryLabel?: string, onSecondary?: () => void) => (
+    <div className="px-4 py-5">
+      <div className="flex justify-center mb-3">
+        <Lottie
+          animationData={mediaGenAnimation}
+          loop={false}
+          autoplay={true}
+          style={{ width: 80, height: 80 }}
+          key={Date.now()}
+        />
+      </div>
+      <div className="text-[13px] font-medium text-foreground text-center">{title}</div>
+      <div className="text-[12px] text-secondary mt-1 text-center">{desc}</div>
+      <button
+        type="button"
+        onClick={onBtn}
+        className="mt-3 w-full rounded-lg bg-primary px-3 py-1.5 text-[12px] font-medium text-white hover:bg-primary/90 transition-colors"
+      >
+        {btnLabel}
+      </button>
+      {secondaryLabel && onSecondary && (
+        <div
+          onClick={onSecondary}
+          className="mt-2 text-center text-[12px] text-secondary hover:text-foreground cursor-pointer transition-colors"
+        >
+          {secondaryLabel}
+        </div>
+      )}
+    </div>
+  );
+
+  const renderDropdownContent = () => {
+    if (!isLoggedIn) {
+      return renderPromptPanel(
+        i18nService.t('mediaLoginTitle'),
+        i18nService.t('mediaLoginDesc'),
+        i18nService.t('mediaLoginBtn'),
+        handleLogin,
+        i18nService.t('mediaLearnMore'),
+        handleSubscribe,
+      );
+    }
+
+    if (!isSubscribed) {
+      return renderPromptPanel(
+        i18nService.t('mediaSubscribeTitle'),
+        i18nService.t('mediaSubscribeDesc'),
+        i18nService.t('mediaSubscribeBtn'),
+        handleSubscribe,
+      );
+    }
+
+  const handleTabSwitch = async (tab: 'image' | 'video') => {
+    setActiveTab(tab);
+    const saved = await localStore.getItem<SavedMediaSelection>(MEDIA_SELECTION_KV_KEY);
+    const entry = saved?.[tab];
+    const models = tab === 'image' ? mediaModels.image : mediaModels.video;
+    if (entry && models.some(m => m.modelId === entry.modelId)) {
+      dispatch(setMediaSelection({
+        draftKey,
+        selection: { mode: tab, modelId: entry.modelId, modelName: entry.modelName },
+      }));
+    } else {
+      dispatch(setMediaSelection({ draftKey, selection: { mode: 'none' } }));
+    }
+  };
+
+    return (
+      <>
+        {/* Tabs */}
+        <div className="border-b border-border/60 p-2">
+          <div className="flex rounded-lg bg-surface-raised p-0.5" role="tablist">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeTab === 'image'}
+              onClick={() => handleTabSwitch('image')}
+              className={`min-w-0 flex-1 rounded-md px-2 py-1.5 text-center text-[12px] font-medium leading-4 transition-colors ${
+                activeTab === 'image'
+                  ? 'bg-surface text-foreground shadow-sm'
+                  : 'text-secondary hover:text-foreground'
+              }`}
+            >
+              <span className="truncate">{i18nService.t('mediaImage')}</span>
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={activeTab === 'video'}
+              onClick={() => handleTabSwitch('video')}
+              className={`min-w-0 flex-1 rounded-md px-2 py-1.5 text-center text-[12px] font-medium leading-4 transition-colors ${
+                activeTab === 'video'
+                  ? 'bg-surface text-foreground shadow-sm'
+                  : 'text-secondary hover:text-foreground'
+              }`}
+            >
+              <span className="truncate">{i18nService.t('mediaVideo')}</span>
+            </button>
+          </div>
+        </div>
+
+        {/* Model List */}
+        <div className="max-h-72 overflow-y-auto py-1">
+          {isLoading ? (
+            <div className="px-2 py-3 text-center text-xs text-secondary">
+              {i18nService.t('mediaLoadingModels')}
+            </div>
+          ) : currentModels.length === 0 ? (
+            <div className="px-2 py-3 text-center text-xs text-secondary">
+              {i18nService.t('mediaNoModels')}
+            </div>
+          ) : (
+            currentModels.map((model) => {
+              const isSelected = selection?.modelId === model.modelId;
+              return (
+                <button
+                  key={model.modelId}
+                  type="button"
+                  onClick={() => handleSelect(activeTab, model)}
+                  className={`flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs transition-colors hover:bg-background/80`}
+                >
+                  <span className="shrink-0 h-4 w-4 [&_svg]:h-4 [&_svg]:w-4">{resolveMediaModelIcon(model)}</span>
+                  <span className="min-w-0 truncate font-medium">{model.displayName}</span>
+                  <span className="flex items-center gap-1.5 ml-auto shrink-0">
+                    <span className={`flex h-3.5 w-3.5 items-center justify-center rounded border ${
+                      isSelected
+                        ? 'border-primary bg-primary'
+                        : 'border-secondary/40'
+                    }`}>
+                      {isSelected && (
+                        <CheckIcon className="h-2.5 w-2.5 text-white" strokeWidth={3} />
+                      )}
+                    </span>
+                  </span>
+                </button>
+              );
+            })
+          )}
+        </div>
+      </>
+    );
+  };
+
+  return (
+    <div className="relative">
+      <button
+        ref={buttonRef}
+        type="button"
+        disabled={disabled}
+        onClick={() => setIsOpen(!isOpen)}
+        className={`flex h-7 w-7 items-center justify-center rounded-lg transition-colors ${
+          selection && selection.mode !== 'none'
+            ? 'text-foreground hover:bg-surface-raised'
+            : 'text-secondary hover:bg-surface-raised hover:text-foreground'
+        } ${disabled ? 'opacity-50 cursor-not-allowed' : ''}`}
+      >
+        {triggerIcon}
+      </button>
+
+      {isOpen && (
+        <div
+          ref={dropdownRef}
+          className="absolute bottom-full right-0 z-50 mb-1 w-60 rounded-xl border border-border bg-surface shadow-popover overflow-hidden"
+        >
+          {renderDropdownContent()}
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default MediaModelPicker;

@@ -41,6 +41,12 @@ export type CoworkImageAttachment = {
   base64Data: string;
 };
 
+export type CoworkMediaSelection = {
+  mode: 'auto' | 'image' | 'video' | 'none';
+  modelId?: string;
+  modelName?: string;
+};
+
 export type CoworkStartOptions = {
   skipInitialUserMessage?: boolean;
   skillIds?: string[];
@@ -50,12 +56,14 @@ export type CoworkStartOptions = {
   confirmationMode?: 'modal' | 'text';
   imageAttachments?: CoworkImageAttachment[];
   agentId?: string;
+  mediaSelection?: CoworkMediaSelection;
 };
 
 export type CoworkContinueOptions = {
   systemPrompt?: string;
   skillIds?: string[];
   imageAttachments?: CoworkImageAttachment[];
+  mediaSelection?: CoworkMediaSelection;
 };
 
 export interface CoworkRuntime {

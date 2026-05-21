@@ -36,6 +36,7 @@ import { buildOpenClawLocalTimeContextPrompt } from '../openclawLocalTimeContext
 import { AgentLifecyclePhase, type AgentLifecyclePhase as AgentLifecyclePhaseValue } from './constants';
 import type {
   CoworkContinueOptions,
+  CoworkMediaSelection,
   CoworkRuntime,
   CoworkRuntimeEvents,
   CoworkStartOptions,
@@ -227,6 +228,12 @@ type ReconciledConversationEntry = {
 
 const isRecord = (value: unknown): value is Record<string, unknown> => {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value));
+};
+
+export const resolveToolEventIsError = (data: unknown): boolean => {
+  if (!isRecord(data)) return false;
+  if (data.isError) return true;
+  return isRecord(data.result) && data.result.isError === true;
 };
 
 const extractAgentNameFromSessionKey = (sessionKey: string | undefined | null): string | undefined => {
@@ -745,6 +752,11 @@ const extractToolText = (payload: unknown): string => {
   }
 };
 
+const extractToolDetails = (payload: unknown): Record<string, unknown> | undefined => {
+  if (!isRecord(payload)) return undefined;
+  return isRecord(payload.details) ? payload.details : undefined;
+};
+
 const toToolInputRecord = (value: unknown): Record<string, unknown> => {
   if (isRecord(value)) {
     return value;
@@ -753,6 +765,35 @@ const toToolInputRecord = (value: unknown): Record<string, unknown> => {
     return {};
   }
   return { value };
+};
+
+const buildMediaGenerationTurnInstruction = (selection?: CoworkMediaSelection): string => {
+  if (!selection || selection.mode === 'none') return '';
+
+  const lines = [
+    '[LobsterAI media generation turn instruction]',
+    'The user selected a LobsterAI media generation model for this turn.',
+  ];
+
+  if (selection.mode === 'image') {
+    lines.push('If the current user request asks to create, generate, draw, render, or make an image/photo/picture, you must call the lobsterai_image_generate tool exactly once with action="generate".');
+    lines.push('Use the current user request and relevant prior conversation as the image prompt.');
+    lines.push('Do not answer with only a text prompt when the user asked for an image.');
+  } else if (selection.mode === 'video') {
+    lines.push('If the current user request asks to create, generate, render, or make a video, you must call the lobster_video_generate tool exactly once with action="generate".');
+    lines.push('Use the current user request and relevant prior conversation as the video prompt.');
+    lines.push('Do not answer with only a text prompt when the user asked for a video.');
+  } else {
+    lines.push('If the current user request asks for image generation, call lobsterai_image_generate with action="generate".');
+    lines.push('If the current user request asks for video generation, call lobster_video_generate with action="generate".');
+    lines.push('Use the current user request and relevant prior conversation as the media prompt.');
+  }
+
+  if (selection.modelId?.trim()) {
+    lines.push(`Use model "${selection.modelId.trim()}" unless the user explicitly requests a different LobsterAI media model.`);
+  }
+
+  return lines.join('\n');
 };
 
 const mergeStreamingText = (
@@ -1391,6 +1432,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
       confirmationMode: options.confirmationMode,
       imageAttachments: options.imageAttachments,
       agentId: options.agentId,
+      mediaSelection: options.mediaSelection,
     });
   }
 
@@ -1400,6 +1442,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
       systemPrompt: options.systemPrompt,
       skillIds: options.skillIds,
       imageAttachments: options.imageAttachments,
+      mediaSelection: options.mediaSelection,
     });
   }
 
@@ -1616,6 +1659,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
       confirmationMode?: 'modal' | 'text';
       imageAttachments?: Array<{ name: string; mimeType: string; base64Data: string }>;
       agentId?: string;
+      mediaSelection?: CoworkMediaSelection;
     },
   ): Promise<void> {
     if (!prompt.trim() && (!options.imageAttachments || options.imageAttachments.length === 0)) {
@@ -1689,10 +1733,15 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
       throw error;
     }
 
+    const outboundSystemPrompt = [
+      options.systemPrompt ?? session.systemPrompt,
+      buildMediaGenerationTurnInstruction(options.mediaSelection),
+    ].filter(p => p?.trim()).join('\n\n');
+
     const outboundMessage = await this.buildOutboundPrompt(
       sessionId,
       prompt,
-      options.systemPrompt ?? session.systemPrompt,
+      outboundSystemPrompt,
       agentId,
     );
     const runCwd = session.cwd?.trim() ? path.resolve(session.cwd.trim()) : undefined;
@@ -2900,7 +2949,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
     const toolName = toolNameRaw || 'Tool';
 
     if (toolNameRaw.toLowerCase() === 'browser') {
-      const isError = Boolean(data.isError);
+      const isError = resolveToolEventIsError(data);
       // Log full data keys and values for diagnosis
       const dataKeys = Object.keys(data);
       const resultType = data.result === undefined ? 'undefined'
@@ -2998,8 +3047,9 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
 
     if (phase === 'result') {
       const incoming = extractToolText(data.result);
+      const toolDetails = extractToolDetails(data.result);
       const previous = turn.toolResultTextByToolCallId.get(toolCallId) ?? '';
-      const isError = Boolean(data.isError);
+      const isError = resolveToolEventIsError(data);
       const finalContent = incoming.trim() ? incoming : previous;
       const finalError = isError ? (finalContent || 'Tool execution failed') : undefined;
       const existingResultMessageId = turn.toolResultMessageIdByToolCallId.get(toolCallId);
@@ -3014,6 +3064,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
             isError,
             isStreaming: false,
             isFinal: true,
+            ...(toolDetails ? { toolResultDetails: toolDetails } : {}),
           },
         });
         this.emit('messageUpdate', sessionId, existingResultMessageId, finalContent);
@@ -3028,6 +3079,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
             isError,
             isStreaming: false,
             isFinal: true,
+            ...(toolDetails ? { toolResultDetails: toolDetails } : {}),
           },
         });
         turn.toolResultMessageIdByToolCallId.set(toolCallId, resultMessage.id);

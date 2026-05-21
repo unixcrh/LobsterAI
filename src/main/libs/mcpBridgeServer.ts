@@ -44,6 +44,21 @@ type PendingAskUser = {
   timer: ReturnType<typeof setTimeout>;
 };
 
+export type MediaGenerationRequest = {
+  tool: string;
+  args: Record<string, unknown>;
+  context: {
+    sessionKey: string;
+    toolCallId: string;
+  };
+};
+
+export type MediaGenerationResponse = {
+  content: Array<{ type: string; text: string }>;
+  isError?: boolean;
+  details?: Record<string, unknown>;
+};
+
 export class McpBridgeServer {
   private server: http.Server | null = null;
   private _port: number | null = null;
@@ -52,6 +67,7 @@ export class McpBridgeServer {
   private readonly pendingAskUser = new Map<string, PendingAskUser>();
   private onAskUserCallback: ((request: AskUserRequest) => void) | null = null;
   private onAskUserDismissCallback: ((requestId: string) => void) | null = null;
+  private onMediaGenerationCallback: ((request: MediaGenerationRequest) => Promise<MediaGenerationResponse>) | null = null;
 
   constructor(mcpManager: McpServerManager, secret: string) {
     this.mcpManager = mcpManager;
@@ -71,6 +87,10 @@ export class McpBridgeServer {
     return this._port ? `http://127.0.0.1:${this._port}/askuser` : null;
   }
 
+  get mediaCallbackUrl(): string | null {
+    return this._port ? `http://127.0.0.1:${this._port}/media-generation/tool` : null;
+  }
+
   /**
    * Register a callback that fires when an AskUserQuestion request arrives.
    * The callback should show a modal and eventually call resolveAskUser().
@@ -85,6 +105,14 @@ export class McpBridgeServer {
    */
   onAskUserDismiss(callback: (requestId: string) => void): void {
     this.onAskUserDismissCallback = callback;
+  }
+
+  /**
+   * Register a callback for media generation tool requests.
+   * The callback should call lobsterai-server and return the result.
+   */
+  onMediaGeneration(callback: (request: MediaGenerationRequest) => Promise<MediaGenerationResponse>): void {
+    this.onMediaGenerationCallback = callback;
   }
 
   /**
@@ -162,8 +190,8 @@ export class McpBridgeServer {
       return;
     }
 
-    // Verify secret token (accept either header name)
-    const authHeader = req.headers['x-mcp-bridge-secret'] || req.headers['x-ask-user-secret'];
+    // Verify secret token (accept any of the known header names)
+    const authHeader = req.headers['x-mcp-bridge-secret'] || req.headers['x-ask-user-secret'] || req.headers['x-lobster-media-secret'];
     if (authHeader !== this.secret) {
       log('WARN', `Auth rejected for ${req.url}: header=${authHeader ? 'present-but-mismatch' : 'missing'}`);
       res.writeHead(401, { 'Content-Type': 'application/json' });
@@ -173,6 +201,11 @@ export class McpBridgeServer {
 
     if (req.url?.startsWith('/askuser')) {
       await this.handleAskUser(req, res);
+      return;
+    }
+
+    if (req.url?.startsWith('/media-generation/tool')) {
+      await this.handleMediaGeneration(req, res);
       return;
     }
 
@@ -298,6 +331,57 @@ export class McpBridgeServer {
       }
     } finally {
       res.removeListener('close', onClose);
+    }
+  }
+
+  private async handleMediaGeneration(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+    const t0 = Date.now();
+    try {
+      const body = await this.readBody(req);
+      const request = JSON.parse(body) as MediaGenerationRequest;
+      const action = typeof request.args?.action === 'string' ? request.args.action : 'generate';
+      const model = typeof request.args?.model === 'string' ? request.args.model : '';
+      const prompt = typeof request.args?.prompt === 'string' ? request.args.prompt : '';
+      log('INFO', `Media generation request received for tool="${request.tool}" action="${action}" toolCallId="${request.context?.toolCallId ?? ''}" sessionKey="${request.context?.sessionKey?.slice(0, 30)}…" args=${serializeForLog({
+        action,
+        model,
+        promptLength: prompt.length,
+        hasImage: typeof request.args?.image === 'string',
+        imageCount: Array.isArray(request.args?.images) ? request.args.images.length : undefined,
+        hasVideo: typeof request.args?.video === 'string',
+        videoCount: Array.isArray(request.args?.videos) ? request.args.videos.length : undefined,
+        aspectRatio: request.args?.aspectRatio,
+        resolution: request.args?.resolution,
+        size: request.args?.size,
+        count: request.args?.count,
+        durationSeconds: request.args?.durationSeconds,
+      })}`);
+
+      if (!request.tool || !request.context?.sessionKey) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ content: [{ type: 'text', text: 'Missing tool or context.sessionKey' }], isError: true }));
+        return;
+      }
+
+      if (!this.onMediaGenerationCallback) {
+        log('WARN', 'Media generation callback not registered');
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ content: [{ type: 'text', text: 'Media generation service not available.' }], isError: true }));
+        return;
+      }
+
+      const result = await this.onMediaGenerationCallback(request);
+      const contentPreview = serializeToolContentForLog(result.content);
+      log('INFO', `Media generation completed for tool="${request.tool}" in ${Date.now() - t0}ms with isError=${result.isError ?? false}. Details=${serializeForLog(result.details ?? {})} Result=${contentPreview}`);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(result));
+    } catch (error) {
+      const errMsg = error instanceof Error ? error.message : String(error);
+      log('ERROR', `Media generation request failed after ${Date.now() - t0}ms: ${errMsg}`);
+      if (!res.writableEnded) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ content: [{ type: 'text', text: `Media generation error: ${errMsg}` }], isError: true }));
+      }
     }
   }
 

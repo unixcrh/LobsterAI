@@ -63,6 +63,31 @@ const artifactSlice = createSlice({
             return;
           }
         }
+        if (artifact.filePath && artifact.remoteUrl && artifact.type === 'image') {
+          const dupIndex = state.artifactsBySession[sessionId].findIndex(
+            a => !a.filePath && a.type === 'image' && a.content === artifact.remoteUrl
+          );
+          if (dupIndex >= 0) {
+            state.artifactsBySession[sessionId][dupIndex] = artifact;
+            return;
+          }
+        }
+        if (!artifact.filePath && artifact.type === 'image' && artifact.content) {
+          const localExists = state.artifactsBySession[sessionId].some(
+            a => a.filePath && a.remoteUrl === artifact.content
+          );
+          if (localExists) return;
+          const dupIndex = state.artifactsBySession[sessionId].findIndex(
+            a => !a.filePath && a.type === 'image' && a.content === artifact.content
+          );
+          if (dupIndex >= 0) {
+            const old = state.artifactsBySession[sessionId][dupIndex];
+            if (artifact.content || !old.content) {
+              state.artifactsBySession[sessionId][dupIndex] = artifact;
+            }
+            return;
+          }
+        }
         state.artifactsBySession[sessionId].push(artifact);
       }
     },

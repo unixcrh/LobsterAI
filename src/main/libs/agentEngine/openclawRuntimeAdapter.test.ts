@@ -12,7 +12,7 @@ vi.mock('electron', () => ({
   },
 }));
 
-import { OpenClawRuntimeAdapter, pickPersistedAssistantSegment } from './openclawRuntimeAdapter';
+import { OpenClawRuntimeAdapter, pickPersistedAssistantSegment, resolveToolEventIsError } from './openclawRuntimeAdapter';
 
 test('pickPersistedAssistantSegment: stream authority keeps previous when same length or longer', () => {
   expect(pickPersistedAssistantSegment('aa', 'a', true)).toEqual({
@@ -52,6 +52,12 @@ test('pickPersistedAssistantSegment: empty branches', () => {
     content: 'prev',
     reason: 'previous_only',
   });
+});
+
+test('resolveToolEventIsError reads nested tool result errors', () => {
+  expect(resolveToolEventIsError({ isError: true })).toBe(true);
+  expect(resolveToolEventIsError({ isError: false, result: { isError: true } })).toBe(true);
+  expect(resolveToolEventIsError({ isError: false, result: { isError: false } })).toBe(false);
 });
 
 // ==================== Session patch tests ====================

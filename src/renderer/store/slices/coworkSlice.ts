@@ -9,6 +9,7 @@ import {
   CoworkSessionStatusValue,
   type CoworkSessionSummary,
 } from '../../types/cowork';
+import type { MediaGenerationSelection, MediaModel } from '../../types/mediaGeneration';
 import { removeSessionFromState, removeSessionsFromState } from './coworkDeleteState';
 
 export interface DraftAttachment {
@@ -33,6 +34,10 @@ interface CoworkState {
   remoteManaged: boolean;
   pendingPermissions: CoworkPermissionRequest[];
   config: CoworkConfig;
+  /** Media generation models fetched from server */
+  mediaModels: { image: MediaModel[]; video: MediaModel[] };
+  /** Media generation mode selection per draft key */
+  mediaSelection: Record<string, MediaGenerationSelection>;
 }
 
 const initialState: CoworkState = {
@@ -73,6 +78,8 @@ const initialState: CoworkState = {
       keepAlive: '30d',
     },
   },
+  mediaModels: { image: [], video: [] },
+  mediaSelection: {},
 };
 
 const markSessionRead = (state: CoworkState, sessionId: string | null) => {
@@ -367,6 +374,19 @@ const coworkSlice = createSlice({
     clearDraftAttachments(state, action: PayloadAction<string>) {
       delete state.draftAttachments[action.payload];
     },
+
+    setMediaModels(state, action: PayloadAction<{ image: MediaModel[]; video: MediaModel[] }>) {
+      state.mediaModels = action.payload;
+    },
+
+    setMediaSelection(state, action: PayloadAction<{ draftKey: string; selection: MediaGenerationSelection }>) {
+      const { draftKey, selection } = action.payload;
+      if (selection.mode === 'none') {
+        delete state.mediaSelection[draftKey];
+      } else {
+        state.mediaSelection[draftKey] = selection;
+      }
+    },
   },
 });
 
@@ -399,6 +419,8 @@ export const {
   setConfig,
   updateConfig,
   clearCurrentSession,
+  setMediaModels,
+  setMediaSelection,
 } = coworkSlice.actions;
 
 export default coworkSlice.reducer;

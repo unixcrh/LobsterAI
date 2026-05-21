@@ -3,6 +3,7 @@ import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, nativeTheme, ne
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { pathToFileURL } from 'url';
 
 import type { OpenClawSessionPatch } from '../common/openclawSession';
 import { buildSessionTitleFromInput } from '../common/sessionTitle';
@@ -16,7 +17,7 @@ import { ProviderName } from '../shared/providers';
 import { AgentManager } from './agentManager';
 import { APP_NAME } from './appConstants';
 import { getAutoLaunchEnabled, isAutoLaunched, setAutoLaunchEnabled } from './autoLaunchManager';
-import { CoworkStore } from './coworkStore';
+import { type CoworkMessage, CoworkStore } from './coworkStore';
 import { setLanguage, t } from './i18n';
 import { IMGatewayConfig, IMGatewayManager } from './im';
 import {
@@ -55,8 +56,9 @@ import { generateSessionTitle, probeCoworkModelReadiness } from './libs/coworkUt
 import { getServerApiBaseUrl, getSkillStoreUrl, refreshEndpointsTestMode } from './libs/endpoints';
 import { mergeEnterpriseOpenclawConfig, resolveEnterpriseConfigPath, syncEnterpriseConfig } from './libs/enterpriseConfigSync';
 import { exportLogsZip } from './libs/logExport';
-import { McpBridgeServer } from './libs/mcpBridgeServer';
+import { McpBridgeServer, type MediaGenerationRequest, type MediaGenerationResponse } from './libs/mcpBridgeServer';
 import { McpServerManager } from './libs/mcpServerManager';
+import { persistGeneratedImageAssets, persistGeneratedVideoAssets, type PersistGeneratedImageAssetsResult, type RemoteGeneratedMediaAsset } from './libs/mediaAssetPersistence';
 import { parsePrimaryModelRef, resolveQualifiedAgentModelRef } from './libs/openclawAgentModels';
 import {
   buildManagedSessionKey,
@@ -93,6 +95,12 @@ import {
 import { getLogFilePath, getRecentMainLogEntries, initLogger } from './logger';
 import type { McpServerFormData } from './mcpStore';
 import { McpStore } from './mcpStore';
+import {
+  MediaGenerationGateReason,
+  MediaGenerationTool,
+  type MediaSelectionState,
+  resolveMediaGenerationGate,
+} from './mediaGenerationPolicy';
 import { OpenClawSessionIpc } from './openclawSession/constants';
 import { OpenClawSessionPolicyIpc } from './openclawSessionPolicy/constants';
 import { loadOpenClawSessionPolicyConfig, saveOpenClawSessionPolicyConfig } from './openclawSessionPolicy/store';
@@ -798,6 +806,7 @@ let sqliteBackupManager: SqliteBackupManager | null = null;
 let openClawEngineManager: OpenClawEngineManager | null = null;
 let openClawConfigSync: OpenClawConfigSync | null = null;
 let openClawBootstrapPromise: Promise<OpenClawEngineStatus> | null = null;
+let cachedSubscriptionStatus = 'free';
 let openClawStatusForwarderBound = false;
 let coworkRuntimeForwarderBound = false;
 let memoryMigrationDone = false;
@@ -1163,12 +1172,14 @@ const getOpenClawConfigSync = (): OpenClawConfigSync => {
         return {
           callbackUrl: mcpBridgeServer.callbackUrl,
           askUserCallbackUrl: mcpBridgeServer.askUserCallbackUrl,
+          mediaCallbackUrl: mcpBridgeServer.mediaCallbackUrl || '',
           secret: mcpBridgeSecret,
           tools: mcpServerManager?.toolManifest ?? [],
         };
       },
       getMcpBridgeSecret: () => mcpBridgeSecret,
       getAgents: () => getCoworkStore().listAgents(),
+      getSubscriptionStatus: () => cachedSubscriptionStatus,
     });
   }
   return openClawConfigSync;
@@ -1394,6 +1405,8 @@ const bindCoworkRuntimeForwarder = (): void => {
   });
 
   runtime.on('complete', (sessionId: string, claudeSessionId: string | null) => {
+    mediaSelectionBySession.delete(sessionId);
+    mediaReferencesBySession.delete(sessionId);
     const windows = BrowserWindow.getAllWindows();
     windows.forEach((win) => {
       if (win.isDestroyed()) return;
@@ -1414,6 +1427,8 @@ const bindCoworkRuntimeForwarder = (): void => {
   });
 
   runtime.on('error', (sessionId: string, error: string) => {
+    mediaSelectionBySession.delete(sessionId);
+    mediaReferencesBySession.delete(sessionId);
     // Mark session as error in store so the .catch() fallback can detect duplicates.
     try { getCoworkStore().updateSession(sessionId, { status: 'error' }); } catch { /* ignore */ }
     const windows = BrowserWindow.getAllWindows();
@@ -1550,15 +1565,27 @@ const startMcpBridge = (): Promise<McpBridgeConfig | null> => {
       });
     });
 
+    // Media generation tool callback — handles lobsterai_image_generate / lobster_video_generate
+    mcpBridgeServer.onMediaGeneration(async (request) => {
+      if (!mediaGenerationHandler) {
+        return {
+          content: [{ type: 'text', text: 'Media generation service is not ready yet.' }],
+          isError: true,
+        };
+      }
+      return await mediaGenerationHandler(request);
+    });
+
     const callbackUrl = mcpBridgeServer.callbackUrl;
     const askUserCallbackUrl = mcpBridgeServer.askUserCallbackUrl;
+    const mediaCallbackUrl = mcpBridgeServer.mediaCallbackUrl;
     if (!callbackUrl || !askUserCallbackUrl) {
       console.error('[McpBridge] failed to get callback URL');
       return null;
     }
 
     console.log(`[McpBridge] started: ${tools.length} MCP tools, callback=${callbackUrl}`);
-    return { callbackUrl, askUserCallbackUrl, secret: mcpBridgeSecret, tools };
+    return { callbackUrl, askUserCallbackUrl, mediaCallbackUrl: mediaCallbackUrl || '', secret: mcpBridgeSecret, tools };
   } catch (error) {
     console.error('[McpBridge] startup error:', error instanceof Error ? error.stack || error.message : String(error));
     return null;
@@ -1855,6 +1882,48 @@ let isQuitting = false;
 
 // 存储活跃的流式请求控制器
 const activeStreamControllers = new Map<string, AbortController>();
+
+// Media generation selection per session (for turn-level tool gating)
+const mediaSelectionBySession = new Map<string, MediaSelectionState>();
+let mediaGenerationHandler: ((request: MediaGenerationRequest) => Promise<MediaGenerationResponse>) | null = null;
+
+// Media attachment references per session (for @ mentions, FR-9)
+interface MediaAttachmentRefMain {
+  token: string;
+  mediaType: 'image' | 'video' | 'audio';
+  index: number;
+  fileId: string;
+  fileName: string;
+  mimeType: string;
+  localPath?: string;
+  remoteUrl?: string;
+  role?: string;
+}
+const mediaReferencesBySession = new Map<string, MediaAttachmentRefMain[]>();
+const persistedGeneratedImageUrls = new Set<string>();
+const persistedGeneratedVideoUrls = new Set<string>();
+
+// Async video task polling (FR-8)
+interface MediaTaskTracker {
+  taskId: string;
+  sessionId: string;
+  mediaType: 'image' | 'video';
+  model: string;
+  startedAt: number;
+  pollCount: number;
+  timeoutMs: number;
+  lastPollAt?: number;
+}
+const pendingMediaTasks = new Map<string, MediaTaskTracker>();
+let mediaTaskPollTimer: ReturnType<typeof setInterval> | null = null;
+const MEDIA_POLL_FAST_MS = 10_000;
+const MEDIA_POLL_SLOW_MS = 30_000;
+const MEDIA_POLL_MEDIUM_MS = 120_000;
+const MEDIA_POLL_IDLE_MS = 600_000;
+const MEDIA_POLL_FAST_COUNT = 6;
+const MEDIA_POLL_SLOW_COUNT = 18;
+const MEDIA_POLL_MEDIUM_COUNT = 10;
+const MEDIA_TASK_DEFAULT_TIMEOUT_MS = 172_800_000;
 let lastReloadAt = 0;
 let windowStateSaveTimer: ReturnType<typeof setTimeout> | null = null;
 const MIN_RELOAD_INTERVAL_MS = 5000;
@@ -2327,6 +2396,664 @@ if (!gotTheLock) {
     return resp;
   };
 
+  const extractSessionIdFromKey = (sessionKey: string): string | null => {
+    const prefix = 'agent:main:lobsterai:';
+    return sessionKey.startsWith(prefix) ? sessionKey.slice(prefix.length) : null;
+  };
+
+  /**
+   * Handle media generation tool callbacks from the OpenClaw plugin.
+   */
+  const handleMediaGenerationCallback = async (request: {
+    tool: string;
+    args: Record<string, unknown>;
+    context: { sessionKey: string; toolCallId: string };
+  }): Promise<{ content: Array<{ type: string; text: string }>; isError?: boolean; details?: Record<string, unknown> }> => {
+    const { tool, args } = request;
+    const action = (args.action as string) || 'generate';
+    const serverBaseUrl = getServerApiBaseUrl();
+    const sessionId = extractSessionIdFromKey(request.context.sessionKey);
+    const selection = sessionId ? mediaSelectionBySession.get(sessionId) : undefined;
+    const prompt = typeof args.prompt === 'string' ? args.prompt : '';
+    const explicitModel = typeof args.model === 'string' ? args.model.trim() : '';
+    const selectedModel = explicitModel || selection?.modelId || '';
+    const selectedModelSource = explicitModel ? 'tool' : selection?.modelId ? 'selection' : 'none';
+    console.log('[MediaGeneration] received tool request:', serializeForLog({
+      tool,
+      action,
+      sessionId: sessionId ?? '',
+      toolCallId: request.context.toolCallId,
+      selectionMode: selection?.mode ?? 'none',
+      selectedModel,
+      selectedModelSource,
+      promptLength: prompt.length,
+      promptPreview: prompt.slice(0, 120),
+    }));
+
+    // Tool gating: for generate action, check if media selection allows this tool
+    if (action === 'generate') {
+      const gate = resolveMediaGenerationGate({ action, tool, selection, explicitModel });
+      if (gate.allowed === false) {
+        if (gate.reason === MediaGenerationGateReason.MediaNotEnabled) {
+          console.warn('[MediaGeneration] blocked generate request because no media model was selected for this turn.');
+        } else {
+          console.warn('[MediaGeneration] blocked generate request because the selected turn model has a different media type.');
+        }
+        return {
+          content: [{ type: 'text', text: gate.message }],
+          isError: true,
+          details: { status: 'failed', warnings: [gate.reason] },
+        };
+      }
+    }
+
+    try {
+      if (action === 'list') {
+        const mediaType = tool === MediaGenerationTool.Image ? 'image' : 'video';
+        const endpoint = mediaType === 'image' ? '/api/media/images/models' : '/api/media/videos/models';
+        console.log(`[MediaGeneration] listing ${mediaType} models from server.`);
+        const resp = await fetchWithAuth(`${serverBaseUrl}${endpoint}`);
+        console.log(`[MediaGeneration] server returned HTTP ${resp.status} for ${mediaType} model list.`);
+        const body = await resp.json() as { code: number; data?: unknown[]; message?: string };
+        if (body.code !== 0) {
+          console.warn('[MediaGeneration] server rejected model list request:', serializeForLog({ mediaType, code: body.code, message: body.message }));
+          return { content: [{ type: 'text', text: body.message || 'Failed to list models.' }], isError: true };
+        }
+        const models = body.data || [];
+        console.log(`[MediaGeneration] server returned ${models.length} ${mediaType} models.`);
+        const text = models.length > 0
+          ? `Available ${mediaType} models:\n${(models as Array<{ modelId: string; displayName: string }>).map(m => `- ${m.displayName} (${m.modelId})`).join('\n')}`
+          : `No ${mediaType} models available.`;
+        return { content: [{ type: 'text', text }], details: { status: 'succeeded', models } };
+      }
+
+      if (action === 'status') {
+        const taskId = args.taskId as string;
+        if (!taskId) {
+          console.warn('[MediaGeneration] blocked status request because taskId was missing.');
+          return { content: [{ type: 'text', text: 'taskId is required for status action.' }], isError: true };
+        }
+        const mediaType = tool === MediaGenerationTool.Image ? 'images' : 'videos';
+        console.log(`[MediaGeneration] checking ${mediaType} task status for task ${taskId}.`);
+        const resp = await fetchWithAuth(`${serverBaseUrl}/api/media/${mediaType}/tasks/${taskId}`);
+        console.log(`[MediaGeneration] server returned HTTP ${resp.status} for ${mediaType} task status.`);
+        const body = await resp.json() as { code: number; data?: Record<string, unknown>; message?: string };
+        if (body.code !== 0) {
+          console.warn('[MediaGeneration] server rejected task status request:', serializeForLog({ mediaType, taskId, code: body.code, message: body.message }));
+          return { content: [{ type: 'text', text: body.message || 'Failed to get task status.' }], isError: true };
+        }
+        const task = body.data!;
+        const status = task.status as string;
+        const resultUrls = (task.resultUrls as string[]) || [];
+        const statusMediaType = tool === MediaGenerationTool.Image ? 'image' : 'video';
+        const assets = resultUrls.map(url => ({
+          type: statusMediaType,
+          url,
+          mimeType: statusMediaType === 'image' ? 'image/png' : 'video/mp4',
+        }));
+
+        let resultLines: string[];
+        if (status === 'succeeded' && statusMediaType === 'image' && sessionId) {
+          const persistResult = await persistGeneratedImages(sessionId, assets);
+          if (persistResult && persistResult.saved.length > 0) {
+            resultLines = persistResult.saved.map(asset =>
+              `  - [${asset.filename}](${pathToFileURL(asset.filePath).toString()})`
+            );
+            emitMediaTaskMessage(sessionId, `Saved generated ${persistResult.saved.length === 1 ? 'image' : 'images'}:\n${resultLines.join('\n')}`, {
+              toolResultDetails: { status: 'succeeded', assets: persistResult.saved },
+            });
+          } else {
+            resultLines = resultUrls.map((url, index) => `  - ![Generated image ${index + 1}](${url})`);
+          }
+        } else if (status === 'succeeded' && statusMediaType === 'video' && sessionId) {
+          const persistResult = await persistGeneratedVideos(sessionId, assets);
+          if (persistResult && persistResult.saved.length > 0) {
+            resultLines = persistResult.saved.map(asset =>
+              `  - [${asset.filename}](${pathToFileURL(asset.filePath).toString()})`
+            );
+            emitMediaTaskMessage(sessionId, `Saved generated ${persistResult.saved.length === 1 ? 'video' : 'videos'}:\n${resultLines.join('\n')}`, {
+              toolResultDetails: { status: 'succeeded', assets: persistResult.saved },
+            });
+          } else {
+            resultLines = resultUrls.map(url => `  - ${url}`);
+          }
+        } else {
+          resultLines = statusMediaType === 'image'
+            ? resultUrls.map((_url, index) => `  - Generated image ${index + 1}`)
+            : resultUrls.map(url => `  - ${url}`);
+        }
+
+        const lines = [
+          `Task ID: ${task.taskId}`,
+          `Status: ${status}`,
+          ...(task.progress ? [`Progress: ${task.progress}%`] : []),
+          ...(resultUrls.length > 0 ? [`Results:\n${resultLines.join('\n')}`] : []),
+          ...(task.errorMessage ? [`Error: ${task.errorMessage}`] : []),
+        ];
+
+        return {
+          content: [{ type: 'text', text: lines.join('\n') }],
+          details: {
+            taskId: String(task.taskId),
+            status,
+            model: task.model as string,
+            ...(assets.length > 0 ? { assets } : {}),
+            ...(task.quotaRemaining != null ? { billing: { quotaRemaining: task.quotaRemaining } } : {}),
+          },
+        };
+      }
+
+      if (action === 'cancel' && tool === MediaGenerationTool.Video) {
+        const taskId = args.taskId as string;
+        if (!taskId) {
+          console.warn('[MediaGeneration] blocked cancel request because taskId was missing.');
+          return { content: [{ type: 'text', text: 'taskId is required for cancel action.' }], isError: true };
+        }
+        console.log(`[MediaGeneration] cancelling video task ${taskId}.`);
+        const resp = await fetchWithAuth(`${serverBaseUrl}/api/media/videos/tasks/${taskId}/cancel`, { method: 'POST' });
+        console.log(`[MediaGeneration] server returned HTTP ${resp.status} for video task cancel.`);
+        const body = await resp.json() as { code: number; message?: string };
+        if (body.code !== 0) {
+          console.warn('[MediaGeneration] server rejected task cancel request:', serializeForLog({ taskId, code: body.code, message: body.message }));
+          return { content: [{ type: 'text', text: body.message || 'Failed to cancel task.' }], isError: true };
+        }
+        return {
+          content: [{ type: 'text', text: `Task ${taskId} cancelled successfully.` }],
+          details: { taskId, status: 'cancelled' },
+        };
+      }
+
+      // action === 'generate'
+      const mediaType = tool === MediaGenerationTool.Image ? 'image' : 'video';
+      const endpoint = mediaType === 'image' ? '/api/media/images/generate' : '/api/media/videos/generate';
+
+      const params: Record<string, unknown> = {};
+      // Merge singular image/video into the images/videos array
+      if (args.image) {
+        const existing = (args.images as string[]) || [];
+        params.images = [args.image as string, ...existing];
+      } else if (args.images) {
+        params.images = args.images;
+      }
+      if (args.imageRoles) params.imageRoles = args.imageRoles;
+      if (args.video) {
+        const existing = (args.videos as string[]) || [];
+        params.videos = [args.video as string, ...existing];
+      } else if (args.videos) {
+        params.videos = args.videos;
+      }
+      if (args.videoRoles) params.videoRoles = args.videoRoles;
+      if (args.aspectRatio) params.aspectRatio = args.aspectRatio;
+      if (args.resolution) params.resolution = args.resolution;
+      if (args.size) params.size = args.size;
+      if (args.count) params.count = args.count;
+      if (args.durationSeconds) params.durationSeconds = args.durationSeconds;
+      if (args.audio != null) params.audio = args.audio;
+      if (args.watermark != null) params.watermark = args.watermark;
+      if (args.filename) params.filename = args.filename;
+      if (args.providerOptions) params.providerOptions = args.providerOptions;
+
+      // Merge @ media references into images/videos/imageRoles/videoRoles
+      const refs = sessionId ? mediaReferencesBySession.get(sessionId) : undefined;
+      if (refs && refs.length > 0) {
+        const imageRefs = refs.filter(r => r.mediaType === 'image' && r.localPath);
+        const videoRefs = refs.filter(r => r.mediaType === 'video' && r.localPath);
+        if (imageRefs.length > 0) {
+          const existing = (params.images as string[]) || [];
+          const imageRoles = (params.imageRoles as string[]) || [];
+          for (const ref of imageRefs) {
+            existing.push(ref.localPath!);
+            imageRoles.push(ref.role || 'reference_image');
+          }
+          params.images = existing;
+          params.imageRoles = imageRoles;
+        }
+        if (videoRefs.length > 0) {
+          const existing = (params.videos as string[]) || [];
+          const videoRoles = (params.videoRoles as string[]) || [];
+          for (const ref of videoRefs) {
+            existing.push(ref.localPath!);
+            videoRoles.push(ref.role || 'reference_video');
+          }
+          params.videos = existing;
+          params.videoRoles = videoRoles;
+        }
+      }
+
+      // Convert local file paths to data URLs (reuses dialog:readFileAsDataUrl pattern)
+      const MEDIA_MIME: Record<string, string> = {
+        '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+        '.gif': 'image/gif', '.webp': 'image/webp', '.bmp': 'image/bmp',
+        '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.webm': 'video/webm',
+      };
+      const resolveRef = async (ref: string): Promise<string> => {
+        if (!ref || ref.startsWith('http') || ref.startsWith('oss://') || ref.startsWith('data:')) return ref;
+        const buf = await fs.promises.readFile(path.resolve(ref));
+        const mime = MEDIA_MIME[path.extname(ref).toLowerCase()] || 'application/octet-stream';
+        return `data:${mime};base64,${buf.toString('base64')}`;
+      };
+      if (Array.isArray(params.images)) {
+        params.images = await Promise.all((params.images as string[]).map(resolveRef));
+      }
+      if (Array.isArray(params.videos)) {
+        params.videos = await Promise.all((params.videos as string[]).map(resolveRef));
+      }
+
+      const generateReq = {
+        model: selectedModel,
+        type: mediaType,
+        prompt,
+        params,
+      };
+
+      console.log('[MediaGeneration] sending generate request to server:', serializeForLog({
+        endpoint,
+        mediaType,
+        selectedModel,
+        selectedModelSource,
+        promptLength: prompt.length,
+        promptPreview: prompt.slice(0, 120),
+        params,
+      }));
+      const resp = await fetchWithAuth(`${serverBaseUrl}${endpoint}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(generateReq),
+      });
+      console.log(`[MediaGeneration] server returned HTTP ${resp.status} for ${mediaType} generate request.`);
+      const body = await resp.json() as { code: number; data?: Record<string, unknown>; message?: string };
+
+      if (body.code === 40203) {
+        console.warn('[MediaGeneration] server rejected generate request because subscription is required.');
+        return {
+          content: [{ type: 'text', text: 'Media generation requires an active subscription. Please subscribe to use this feature.' }],
+          isError: true,
+          details: { status: 'failed', warnings: ['MEDIA_SUBSCRIPTION_REQUIRED'] },
+        };
+      }
+      if (body.code === 40204) {
+        console.warn('[MediaGeneration] server rejected generate request because quota was exhausted.');
+        return {
+          content: [{ type: 'text', text: 'Media generation quota exhausted for this period. Please wait for quota reset or upgrade your plan.' }],
+          isError: true,
+          details: { status: 'failed', warnings: ['MEDIA_QUOTA_EXHAUSTED'] },
+        };
+      }
+      if (body.code !== 0) {
+        console.warn('[MediaGeneration] server rejected generate request:', serializeForLog({ mediaType, selectedModel, code: body.code, message: body.message }));
+        return {
+          content: [{ type: 'text', text: body.message || 'Media generation request failed.' }],
+          isError: true,
+          details: { status: 'failed', warnings: [body.message || 'Unknown error'] },
+        };
+      }
+
+      const task = body.data!;
+      const status = task.status as string;
+      const resultUrls = (task.resultUrls as string[]) || [];
+      console.log('[MediaGeneration] server accepted generate request:', serializeForLog({
+        mediaType,
+        taskId: task.taskId,
+        status,
+        model: task.model || selectedModel,
+        resultCount: resultUrls.length,
+        quotaRemaining: task.quotaRemaining,
+      }));
+      const assets = resultUrls.map(url => ({
+        type: mediaType,
+        url,
+        mimeType: mediaType === 'image' ? 'image/png' : 'video/mp4',
+        ...(args.filename ? { filename: args.filename as string } : {}),
+      }));
+
+      const billing: Record<string, unknown> = {};
+      if (task.quotaRemaining != null) billing.quotaRemaining = task.quotaRemaining;
+      if (mediaType === 'image') {
+        if (args.count) billing.frozenImages = args.count;
+      } else {
+        if (args.durationSeconds) billing.frozenVideoSeconds = args.durationSeconds;
+      }
+
+      const lines = [
+        `${mediaType === 'image' ? 'Image' : 'Video'} generation task created.`,
+        `Task ID: ${task.taskId}`,
+        `Model: ${task.model || selectedModel || 'default'}`,
+        `Status: ${status}`,
+        ...(task.quotaRemaining != null ? [`Quota remaining: ${task.quotaRemaining}`] : []),
+      ];
+
+      if (status === 'succeeded' && mediaType === 'image' && sessionId) {
+        const persistResult = await persistGeneratedImages(sessionId, assets);
+        if (persistResult && persistResult.saved.length > 0) {
+          const fileLines = persistResult.saved.map(asset =>
+            `  - [${asset.filename}](${pathToFileURL(asset.filePath).toString()})`
+          );
+          lines.push(`Results:\n${fileLines.join('\n')}`);
+          emitMediaTaskMessage(sessionId, `Saved generated ${persistResult.saved.length === 1 ? 'image' : 'images'}:\n${fileLines.join('\n')}`, {
+            toolResultDetails: { status: 'succeeded', assets: persistResult.saved },
+          });
+        } else if (assets.length > 0) {
+          const resultLines = resultUrls.map((url, index) => `  - ![Generated image ${index + 1}](${url})`);
+          lines.push(`Results:\n${resultLines.join('\n')}`);
+        }
+      } else if (status === 'succeeded' && mediaType === 'video' && sessionId) {
+        const persistResult = await persistGeneratedVideos(sessionId, assets);
+        if (persistResult && persistResult.saved.length > 0) {
+          const fileLines = persistResult.saved.map(asset =>
+            `  - [${asset.filename}](${pathToFileURL(asset.filePath).toString()})`
+          );
+          lines.push(`Results:\n${fileLines.join('\n')}`);
+          emitMediaTaskMessage(sessionId, `Saved generated ${persistResult.saved.length === 1 ? 'video' : 'videos'}:\n${fileLines.join('\n')}`, {
+            toolResultDetails: { status: 'succeeded', assets: persistResult.saved },
+          });
+        } else if (assets.length > 0) {
+          const resultLines = resultUrls.map(url => `  - ${url}`);
+          lines.push(`Results:\n${resultLines.join('\n')}`);
+        }
+      } else if (status === 'succeeded' && assets.length > 0) {
+        const resultLines = resultUrls.map(url => `  - ${url}`);
+        lines.push(`Results:\n${resultLines.join('\n')}`);
+      }
+
+      // Register async media tasks for background polling if not already completed.
+      if (status !== 'succeeded' && status !== 'failed' && status !== 'cancelled') {
+        if (sessionId) {
+          const metadata = task.metadata as Record<string, unknown> | undefined;
+          const expiresAfterSec = metadata?.execution_expires_after ?? task.execution_expires_after;
+          const timeoutMs = typeof expiresAfterSec === 'number' && expiresAfterSec > 0
+            ? expiresAfterSec * 1000
+            : MEDIA_TASK_DEFAULT_TIMEOUT_MS;
+          registerMediaTaskForPolling({
+            taskId: String(task.taskId),
+            sessionId,
+            mediaType,
+            model: (task.model as string) || selectedModel,
+            startedAt: Date.now(),
+            pollCount: 0,
+            timeoutMs,
+          });
+        }
+      }
+
+      return {
+        content: [{ type: 'text', text: lines.join('\n') }],
+        details: {
+          taskId: String(task.taskId),
+          status,
+          model: (task.model as string) || selectedModel,
+          ...(assets.length > 0 ? { assets } : {}),
+          ...(Object.keys(billing).length > 0 ? { billing } : {}),
+        },
+      };
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      if (msg === 'No auth tokens') {
+        console.warn('[MediaGeneration] blocked media generation because the user is not logged in.');
+        return { content: [{ type: 'text', text: 'Not logged in. Please log in to use media generation.' }], isError: true };
+      }
+      console.error('[MediaGeneration] media generation request failed:', error);
+      return { content: [{ type: 'text', text: `Media generation error: ${msg}` }], isError: true };
+    }
+  };
+
+  mediaGenerationHandler = handleMediaGenerationCallback;
+
+  /**
+   * Register a media task for background polling until completion.
+   */
+  const registerMediaTaskForPolling = (tracker: MediaTaskTracker) => {
+    pendingMediaTasks.set(tracker.taskId, tracker);
+    ensureMediaPollTimerRunning();
+  };
+
+  const ensureMediaPollTimerRunning = () => {
+    if (mediaTaskPollTimer) return;
+    mediaTaskPollTimer = setInterval(() => {
+      void pollPendingMediaTasks();
+    }, MEDIA_POLL_FAST_MS);
+  };
+
+  const stopMediaPollTimer = () => {
+    if (mediaTaskPollTimer) {
+      clearInterval(mediaTaskPollTimer);
+      mediaTaskPollTimer = null;
+    }
+  };
+
+  const pollPendingMediaTasks = async () => {
+    if (pendingMediaTasks.size === 0) {
+      stopMediaPollTimer();
+      return;
+    }
+
+    const serverBaseUrl = getServerApiBaseUrl();
+    const now = Date.now();
+    const tasksToRemove: string[] = [];
+
+    for (const [taskId, tracker] of pendingMediaTasks) {
+      // Check timeout
+      if (now - tracker.startedAt > tracker.timeoutMs) {
+        tasksToRemove.push(taskId);
+        emitMediaTaskMessage(tracker.sessionId, `${tracker.mediaType === 'video' ? 'Video' : 'Image'} generation timed out.\nTask ID: ${taskId}\nStatus: timeout`);
+        continue;
+      }
+
+      // Skip if not enough time has passed for the current polling tier
+      if (tracker.pollCount >= MEDIA_POLL_FAST_COUNT) {
+        const lastPollTime = tracker.lastPollAt ?? tracker.startedAt;
+        const sinceLast = now - lastPollTime;
+        const totalSlowAndMedium = MEDIA_POLL_FAST_COUNT + MEDIA_POLL_SLOW_COUNT;
+        const totalBeforeIdle = totalSlowAndMedium + MEDIA_POLL_MEDIUM_COUNT;
+        if (tracker.pollCount >= totalBeforeIdle) {
+          if (sinceLast < MEDIA_POLL_IDLE_MS) continue;
+        } else if (tracker.pollCount >= totalSlowAndMedium) {
+          if (sinceLast < MEDIA_POLL_MEDIUM_MS) continue;
+        } else {
+          if (sinceLast < MEDIA_POLL_SLOW_MS) continue;
+        }
+      }
+
+      tracker.pollCount++;
+      tracker.lastPollAt = now;
+
+      try {
+        const endpoint = tracker.mediaType === 'video' ? 'videos' : 'images';
+        const resp = await fetchWithAuth(`${serverBaseUrl}/api/media/${endpoint}/tasks/${taskId}`);
+        const body = await resp.json() as { code: number; data?: Record<string, unknown>; message?: string };
+
+        if (body.code !== 0) continue;
+        const task = body.data!;
+        const status = task.status as string;
+
+        if (status === 'succeeded' || status === 'failed' || status === 'cancelled') {
+          tasksToRemove.push(taskId);
+          const resultUrls = (task.resultUrls as string[]) || [];
+          const resultLines = tracker.mediaType === 'image'
+            ? resultUrls.map((_url, index) => `  - Generated image ${index + 1}`)
+            : resultUrls.map(url => `  - ${url}`);
+          const assets = resultUrls.map(url => ({
+            type: tracker.mediaType,
+            url,
+            mimeType: tracker.mediaType === 'image' ? 'image/png' : 'video/mp4',
+          }));
+          const lines = [
+            `${tracker.mediaType === 'video' ? 'Video' : 'Image'} generation ${status}.`,
+            `Task ID: ${taskId}`,
+            `Model: ${tracker.model}`,
+            ...(resultUrls.length > 0 ? [`Results:\n${resultLines.join('\n')}`] : []),
+            ...(task.errorMessage ? [`Error: ${task.errorMessage}`] : []),
+          ];
+          emitMediaTaskMessage(tracker.sessionId, lines.join('\n'));
+          if (status === 'succeeded' && tracker.mediaType === 'image') {
+            scheduleGeneratedImagePersistence(tracker.sessionId, assets);
+          } else if (status === 'succeeded' && tracker.mediaType === 'video') {
+            scheduleGeneratedVideoPersistence(tracker.sessionId, assets);
+          }
+          // Notify renderer to refresh quota
+          BrowserWindow.getAllWindows().forEach(win => {
+            if (!win.isDestroyed()) win.webContents.send('auth:quotaChanged');
+          });
+        }
+      } catch {
+        // Network error, retry on next poll
+      }
+    }
+
+    for (const taskId of tasksToRemove) {
+      pendingMediaTasks.delete(taskId);
+    }
+
+    if (pendingMediaTasks.size === 0) {
+      stopMediaPollTimer();
+    }
+  };
+
+  const emitMediaTaskMessage = (sessionId: string, content: string, metadata?: Record<string, unknown>) => {
+    let message: CoworkMessage = {
+      id: `media-task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      type: 'system' as const,
+      content,
+      timestamp: Date.now(),
+      ...(metadata ? { metadata } : {}),
+    };
+    // Persist to store
+    try {
+      message = getCoworkStore().addMessage(sessionId, {
+        type: 'system',
+        content,
+        ...(metadata ? { metadata } : {}),
+      });
+    } catch {
+      // Session may have been deleted
+    }
+    // Send to renderer
+    BrowserWindow.getAllWindows().forEach(win => {
+      if (!win.isDestroyed()) {
+        win.webContents.send('cowork:stream:message', { sessionId, message });
+      }
+    });
+  };
+
+  const persistGeneratedImages = async (
+    sessionId: string,
+    assets: RemoteGeneratedMediaAsset[],
+  ): Promise<PersistGeneratedImageAssetsResult | null> => {
+    const imageAssets = assets.filter(asset => asset.type === 'image' && asset.url.trim());
+    if (imageAssets.length === 0) return null;
+
+    const sessionForAssets = getCoworkStore().getSession(sessionId);
+    const cwd = sessionForAssets?.cwd?.trim();
+    if (!cwd) {
+      console.warn('[MediaGeneration] skipped image persistence because the session working directory was missing.');
+      return null;
+    }
+
+    const pendingAssets = imageAssets.filter(asset => {
+      const key = `${sessionId}:${asset.url.trim()}`;
+      if (persistedGeneratedImageUrls.has(key)) return false;
+      persistedGeneratedImageUrls.add(key);
+      return true;
+    });
+    if (pendingAssets.length === 0) return null;
+
+    try {
+      const result = await persistGeneratedImageAssets({
+        cwd,
+        assets: pendingAssets,
+        fetchAsset: url => session.defaultSession.fetch(url),
+      });
+      for (const failed of result.failed) {
+        persistedGeneratedImageUrls.delete(`${sessionId}:${failed.url}`);
+        console.warn('[MediaGeneration] failed to persist generated image:', serializeForLog({ sessionId, error: failed.error }));
+      }
+      return result;
+    } catch (error) {
+      for (const asset of pendingAssets) {
+        persistedGeneratedImageUrls.delete(`${sessionId}:${asset.url.trim()}`);
+      }
+      console.warn('[MediaGeneration] failed to persist generated image assets:', error);
+      return null;
+    }
+  };
+
+  const scheduleGeneratedImagePersistence = (sessionId: string, assets: RemoteGeneratedMediaAsset[]) => {
+    void persistGeneratedImages(sessionId, assets).then(result => {
+      if (!result || result.saved.length === 0) return;
+      const fileLines = result.saved.map(asset => `  - [${asset.filename}](${pathToFileURL(asset.filePath).toString()})`);
+      emitMediaTaskMessage(
+        sessionId,
+        `Saved generated ${result.saved.length === 1 ? 'image' : 'images'}:\n${fileLines.join('\n')}`,
+        {
+          toolResultDetails: {
+            status: 'succeeded',
+            assets: result.saved,
+          },
+        },
+      );
+      console.log(`[MediaGeneration] persisted ${result.saved.length} generated image assets.`);
+    });
+  };
+
+  const persistGeneratedVideos = async (
+    sessionId: string,
+    assets: RemoteGeneratedMediaAsset[],
+  ): Promise<PersistGeneratedImageAssetsResult | null> => {
+    const videoAssets = assets.filter(asset => asset.type === 'video' && asset.url.trim());
+    if (videoAssets.length === 0) return null;
+
+    const sessionForAssets = getCoworkStore().getSession(sessionId);
+    const cwd = sessionForAssets?.cwd?.trim();
+    if (!cwd) {
+      console.warn('[MediaGeneration] skipped video persistence because the session working directory was missing.');
+      return null;
+    }
+
+    const pendingAssets = videoAssets.filter(asset => {
+      const key = `${sessionId}:${asset.url.trim()}`;
+      if (persistedGeneratedVideoUrls.has(key)) return false;
+      persistedGeneratedVideoUrls.add(key);
+      return true;
+    });
+    if (pendingAssets.length === 0) return null;
+
+    try {
+      const result = await persistGeneratedVideoAssets({
+        cwd,
+        assets: pendingAssets,
+        fetchAsset: url => session.defaultSession.fetch(url),
+      });
+      for (const failed of result.failed) {
+        persistedGeneratedVideoUrls.delete(`${sessionId}:${failed.url}`);
+        console.warn('[MediaGeneration] failed to persist generated video:', serializeForLog({ sessionId, error: failed.error }));
+      }
+      return result;
+    } catch (error) {
+      for (const asset of pendingAssets) {
+        persistedGeneratedVideoUrls.delete(`${sessionId}:${asset.url.trim()}`);
+      }
+      console.warn('[MediaGeneration] failed to persist generated video assets:', error);
+      return null;
+    }
+  };
+
+  const scheduleGeneratedVideoPersistence = (sessionId: string, assets: RemoteGeneratedMediaAsset[]) => {
+    void persistGeneratedVideos(sessionId, assets).then(result => {
+      if (!result || result.saved.length === 0) return;
+      const fileLines = result.saved.map(asset => `  - [${asset.filename}](${pathToFileURL(asset.filePath).toString()})`);
+      emitMediaTaskMessage(
+        sessionId,
+        `Saved generated ${result.saved.length === 1 ? 'video' : 'videos'}:\n${fileLines.join('\n')}`,
+        {
+          toolResultDetails: {
+            status: 'succeeded',
+            assets: result.saved,
+          },
+        },
+      );
+      console.log(`[MediaGeneration] persisted ${result.saved.length} generated video assets.`);
+    });
+  };
+
   /**
    * Normalize quota data from various server response formats into a unified shape.
    */
@@ -2356,8 +3083,11 @@ if (!gotTheLock) {
       subscriptionStatus = (raw.subscriptionStatus as string) || 'free';
     } else if (typeof raw.creditsLimit === 'number') {
       // Already normalized
+      cachedSubscriptionStatus = (raw.subscriptionStatus as string) || cachedSubscriptionStatus;
       return raw;
     }
+
+    cachedSubscriptionStatus = subscriptionStatus;
 
     return {
       planName,
@@ -2406,7 +3136,12 @@ if (!gotTheLock) {
       }
       saveAuthTokens(body.data.accessToken, body.data.refreshToken);
       console.log('[Auth] exchange user data:', JSON.stringify(body.data.user));
-      return { success: true, user: body.data.user, quota: normalizeQuota(body.data.quota) };
+      const prevStatus = cachedSubscriptionStatus;
+      const quota = normalizeQuota(body.data.quota);
+      if (cachedSubscriptionStatus !== prevStatus) {
+        syncOpenClawConfig({ reason: 'subscription-status-changed', restartGatewayIfRunning: true }).catch(() => {});
+      }
+      return { success: true, user: body.data.user, quota };
     } catch (error) {
       console.error('[Auth] exchange failed:', error);
       return { success: false, error: error instanceof Error ? error.message : 'Exchange failed' };
@@ -2429,7 +3164,11 @@ if (!gotTheLock) {
       if (quotaResp.ok) {
         const quotaBody = await quotaResp.json() as { code: number; data: Record<string, unknown> };
         if (quotaBody.code === 0 && quotaBody.data) {
+          const prevStatus = cachedSubscriptionStatus;
           quota = normalizeQuota(quotaBody.data);
+          if (cachedSubscriptionStatus !== prevStatus) {
+            syncOpenClawConfig({ reason: 'subscription-status-changed', restartGatewayIfRunning: true }).catch(() => {});
+          }
         }
       }
       console.log('[Auth] getUser profile data:', JSON.stringify(profileBody.data));
@@ -2448,7 +3187,12 @@ if (!gotTheLock) {
       if (!resp.ok) return { success: false };
       const body = await resp.json() as { code: number; data: Record<string, unknown> };
       if (body.code !== 0 || !body.data) return { success: false };
-      return { success: true, quota: normalizeQuota(body.data) };
+      const prevStatus = cachedSubscriptionStatus;
+      const quota = normalizeQuota(body.data);
+      if (cachedSubscriptionStatus !== prevStatus) {
+        syncOpenClawConfig({ reason: 'subscription-status-changed', restartGatewayIfRunning: true }).catch(() => {});
+      }
+      return { success: true, quota };
     } catch {
       return { success: false };
     }
@@ -2481,10 +3225,16 @@ if (!gotTheLock) {
       }
       clearAuthTokens();
       clearServerModelMetadata();
+      const prevStatus = cachedSubscriptionStatus;
+      cachedSubscriptionStatus = 'free';
+      if (prevStatus !== 'free') {
+        syncOpenClawConfig({ reason: 'subscription-status-changed', restartGatewayIfRunning: true }).catch(() => {});
+      }
       return { success: true };
     } catch {
       clearAuthTokens();
       clearServerModelMetadata();
+      cachedSubscriptionStatus = 'free';
       return { success: true };
     }
   });
@@ -2547,6 +3297,51 @@ if (!gotTheLock) {
     } catch (e) {
       console.error('[Auth:getModels] Error:', e);
       return { success: false };
+    }
+  });
+
+  // Media generation IPC handlers
+  ipcMain.handle('media:getModels', async (_event, type: 'image' | 'video') => {
+    try {
+      const tokens = getAuthTokens();
+      if (!tokens) {
+        console.warn('[Media:getModels] No auth tokens, skipping');
+        return { success: false, error: 'Not logged in' };
+      }
+      const serverBaseUrl = getServerApiBaseUrl();
+      const endpoint = type === 'image' ? '/api/media/images/models' : '/api/media/videos/models';
+      console.log('[Media:getModels] Fetching:', `${serverBaseUrl}${endpoint}`);
+      const resp = await fetchWithAuth(`${serverBaseUrl}${endpoint}`);
+      console.log('[Media:getModels] Response status:', resp.status);
+      if (!resp.ok) return { success: false, error: `HTTP ${resp.status}` };
+      const body = await resp.json() as { code: number; data?: unknown[]; message?: string };
+      console.log('[Media:getModels] Response body:', JSON.stringify(body));
+      if (body.code !== 0) return { success: false, error: body.message };
+      return { success: true, models: body.data || [] };
+    } catch (e) {
+      console.error('[Media:getModels] Error:', e);
+      return { success: false, error: e instanceof Error ? e.message : 'Unknown error' };
+    }
+  });
+
+  ipcMain.handle('media:getTaskStatus', async (_event, taskId: number, type: 'image' | 'video') => {
+    try {
+      const tokens = getAuthTokens();
+      if (!tokens) return { success: false, error: 'Not logged in' };
+      const serverBaseUrl = getServerApiBaseUrl();
+      const mediaPath = type === 'image' ? 'images' : 'videos';
+      const taskUrl = `${serverBaseUrl}/api/media/${mediaPath}/tasks/${taskId}`;
+      console.log('[Media:getTaskStatus] Fetching:', taskUrl);
+      const resp = await fetchWithAuth(taskUrl);
+      console.log('[Media:getTaskStatus] Response status:', resp.status);
+      if (!resp.ok) return { success: false, error: `HTTP ${resp.status}` };
+      const body = await resp.json() as { code: number; data?: unknown; message?: string };
+      console.log('[Media:getTaskStatus] Response body:', JSON.stringify(body));
+      if (body.code !== 0) return { success: false, error: body.message };
+      return { success: true, task: body.data };
+    } catch (e) {
+      console.error('[Media:getTaskStatus] Error:', e);
+      return { success: false, error: e instanceof Error ? e.message : 'Unknown error' };
     }
   });
 
@@ -2869,6 +3664,7 @@ if (!gotTheLock) {
     imageAttachments?: Array<{ name: string; mimeType: string; base64Data: string }>;
     agentId?: string;
     modelOverride?: string;
+    mediaSelection?: { mode: 'auto' | 'image' | 'video' | 'none'; modelId?: string; modelName?: string };
   }) => {
     try {
       const engineStatus = await ensureOpenClawRunningForCowork();
@@ -2914,6 +3710,13 @@ if (!gotTheLock) {
         console.log('[Cowork:StartSession] session created with modelOverride:', session.id, options.modelOverride);
       }
 
+      // Store media generation selection for tool gating
+      if (options.mediaSelection && options.mediaSelection.mode !== 'none') {
+        mediaSelectionBySession.set(session.id, options.mediaSelection);
+      } else {
+        mediaSelectionBySession.delete(session.id);
+      }
+
       // Update session status to 'running' before starting async task
       // This ensures the frontend receives the correct status immediately
       coworkStoreInstance.updateSession(session.id, { status: 'running' });
@@ -2954,6 +3757,7 @@ if (!gotTheLock) {
         confirmationMode: 'modal',
         imageAttachments: options.imageAttachments,
         agentId: options.agentId,
+        mediaSelection: options.mediaSelection,
       }).catch(error => {
         console.error('[Cowork] session error:', error);
         try {
@@ -2992,6 +3796,8 @@ if (!gotTheLock) {
     systemPrompt?: string;
     activeSkillIds?: string[];
     imageAttachments?: Array<{ name: string; mimeType: string; base64Data: string }>;
+    mediaSelection?: { mode: 'auto' | 'image' | 'video' | 'none'; modelId?: string; modelName?: string };
+    mediaReferences?: MediaAttachmentRefMain[];
   }) => {
     try {
       const engineStatus = await ensureOpenClawRunningForCowork();
@@ -3001,6 +3807,21 @@ if (!gotTheLock) {
 
       const runtime = getCoworkEngineRouter();
       const existingSession = getCoworkStore().getSession(options.sessionId);
+
+      // Update media generation selection for tool gating
+      if (options.mediaSelection && options.mediaSelection.mode !== 'none') {
+        mediaSelectionBySession.set(options.sessionId, options.mediaSelection);
+      } else {
+        mediaSelectionBySession.delete(options.sessionId);
+      }
+
+      // Store media references for this turn (used in handleMediaGenerationCallback)
+      if (options.mediaReferences?.length) {
+        mediaReferencesBySession.set(options.sessionId, options.mediaReferences);
+      } else {
+        mediaReferencesBySession.delete(options.sessionId);
+      }
+
       if (options.imageAttachments?.length) {
         console.log('[Cowork:ContinueSession] imageAttachments received via IPC:', {
           sessionId: options.sessionId,
@@ -3018,6 +3839,7 @@ if (!gotTheLock) {
         ),
         skillIds: options.activeSkillIds,
         imageAttachments: options.imageAttachments,
+        mediaSelection: options.mediaSelection,
       }).catch(error => {
         console.error('[Cowork] continue error:', error);
         try {
@@ -3065,6 +3887,12 @@ if (!gotTheLock) {
       getCoworkEngineRouter().stopSession(sessionId);
       const coworkStoreInstance = getCoworkStore();
       coworkStoreInstance.deleteSession(sessionId);
+      mediaSelectionBySession.delete(sessionId);
+      mediaReferencesBySession.delete(sessionId);
+      // Remove any pending media tasks for this session
+      for (const [taskId, tracker] of pendingMediaTasks) {
+        if (tracker.sessionId === sessionId) pendingMediaTasks.delete(taskId);
+      }
       // Clean up IM session mapping so that new channel messages
       // create a fresh session instead of referencing a deleted one.
       try {
@@ -5486,17 +6314,36 @@ if (!gotTheLock) {
   };
 
   // 设置 Content Security Policy
+  const sanitizeResponseHeaders = (
+    headers: Record<string, string[]> | undefined
+  ): Record<string, string[]> => {
+    if (!headers) return {};
+    const result: Record<string, string[]> = {};
+    for (const [key, values] of Object.entries(headers)) {
+      const safe = values.filter(v => {
+        for (let i = 0; i < v.length; i++) {
+          if (v.charCodeAt(i) > 255) return false;
+        }
+        return true;
+      });
+      if (safe.length > 0) {
+        result[key] = safe;
+      }
+    }
+    return result;
+  };
+
   const setContentSecurityPolicy = () => {
     session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
       // 跳过企微授权页面，让其使用自身的 CSP（否则外部脚本被阻止导致空白页）
       if (isWecomAuthUrl(details.url)) {
-        callback({ responseHeaders: details.responseHeaders });
+        callback({ responseHeaders: sanitizeResponseHeaders(details.responseHeaders) });
         return;
       }
 
       // 跳过 artifact 沙箱及其 vendor 脚本的 CSP（iframe sandbox="allow-scripts" 隔离）
       if (isArtifactSandboxUrl(details.url)) {
-        callback({ responseHeaders: details.responseHeaders });
+        callback({ responseHeaders: sanitizeResponseHeaders(details.responseHeaders) });
         return;
       }
 
@@ -5516,7 +6363,7 @@ if (!gotTheLock) {
 
       callback({
         responseHeaders: {
-          ...details.responseHeaders,
+          ...sanitizeResponseHeaders(details.responseHeaders),
           'Content-Security-Policy': cspDirectives.join('; ')
         }
       });
@@ -5784,6 +6631,8 @@ if (!gotTheLock) {
     console.log('[Main] App is quitting, starting cleanup...');
     destroyTray();
     skillManager?.stopWatching();
+    stopMediaPollTimer();
+    pendingMediaTasks.clear();
 
     // Stop Cowork sessions without blocking shutdown.
     if (coworkEngineRouter) {

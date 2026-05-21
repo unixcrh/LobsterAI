@@ -14,6 +14,7 @@ export interface Artifact {
   language?: string;
   fileName?: string;
   filePath?: string;
+  remoteUrl?: string;
   source: ArtifactSource;
   createdAt: number;
 }

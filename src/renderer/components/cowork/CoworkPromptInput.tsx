@@ -1,6 +1,6 @@
 import { CheckIcon, ChevronDownIcon, ExclamationTriangleIcon } from '@heroicons/react/24/outline';
 import { ArrowUpIcon, FolderIcon, StopIcon } from '@heroicons/react/24/solid';
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useDispatch, useSelector } from 'react-redux';
 
 import { triggerSystemDictation } from '../../hooks/useSpeechToText';
@@ -22,6 +22,7 @@ import {
 import type { Model } from '../../store/slices/modelSlice';
 import { setSkills, toggleActiveSkill } from '../../store/slices/skillSlice';
 import { CoworkImageAttachment } from '../../types/cowork';
+import type { MediaAttachmentRef } from '../../types/mediaGeneration';
 import { Skill } from '../../types/skill';
 import { getAgentDisplayName, shouldUseDefaultAgentIcon } from '../../utils/agentDisplay';
 import { toOpenClawModelRef } from '../../utils/openclawModelRef';
@@ -36,6 +37,8 @@ import { ActiveSkillBadge, SkillsButton } from '../skills';
 import { resolveAgentModelSelection, resolveEffectiveModel, useAgentSelectedModel } from './agentModelSelection';
 import AttachmentCard from './AttachmentCard';
 import FolderSelectorPopover from './FolderSelectorPopover';
+import MediaMentionPicker, { computeMediaLabels, type MediaLabel } from './MediaMentionPicker';
+import MediaModelPicker from './MediaModelPicker';
 import { usePersistAgentModelSelection } from './usePersistAgentModelSelection';
 
 // CoworkAttachment is aliased from the Redux-persisted DraftAttachment type
@@ -152,7 +155,7 @@ export interface CoworkPromptInputRef {
 }
 
 interface CoworkPromptInputProps {
-  onSubmit: (prompt: string, skillPrompt?: string, imageAttachments?: CoworkImageAttachment[]) => boolean | void | Promise<boolean | void>;
+  onSubmit: (prompt: string, skillPrompt?: string, imageAttachments?: CoworkImageAttachment[], mediaReferences?: MediaAttachmentRef[]) => boolean | void | Promise<boolean | void>;
   onStop?: () => void;
   isStreaming?: boolean;
   placeholder?: string;
@@ -211,6 +214,9 @@ const CoworkPromptInput = React.forwardRef<CoworkPromptInputRef, CoworkPromptInp
     const [isPatchingModel, setIsPatchingModel] = useState(false);
     const [showAgentMenu, setShowAgentMenu] = useState(false);
     const [isReadOnlyContextCompact, setIsReadOnlyContextCompact] = useState(false);
+    const [mentionPickerOpen, setMentionPickerOpen] = useState(false);
+    const [mentionFilter, setMentionFilter] = useState('');
+    const [mentionCursorPos, setMentionCursorPos] = useState(0);
 
     const handleVoiceInput = useCallback(() => {
       textareaRef.current?.focus();
@@ -413,6 +419,45 @@ const CoworkPromptInput = React.forwardRef<CoworkPromptInputRef, CoworkPromptInp
     }
   }, [value, draftPrompt, dispatch, draftKey]);
 
+  const mediaLabels = useMemo(() => computeMediaLabels(attachments), [attachments]);
+
+  const handleMentionSelect = useCallback((item: MediaLabel) => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+    const before = value.slice(0, mentionCursorPos);
+    const after = value.slice(textarea.selectionStart);
+    // Remove the partial @filter text that the user typed
+    const atIdx = before.lastIndexOf('@');
+    const newValue = before.slice(0, atIdx) + `@${item.label}` + ' ' + after;
+    setValue(newValue);
+    setMentionPickerOpen(false);
+    setMentionFilter('');
+    textarea.focus();
+  }, [value, mentionCursorPos]);
+
+  const handleTextareaChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const newValue = e.target.value;
+    setValue(newValue);
+
+    // Detect @ mention trigger
+    const cursorPos = e.target.selectionStart;
+    const textBeforeCursor = newValue.slice(0, cursorPos);
+    const lastAtIdx = textBeforeCursor.lastIndexOf('@');
+    if (lastAtIdx !== -1 && mediaLabels.length > 0) {
+      const charBeforeAt = lastAtIdx > 0 ? textBeforeCursor[lastAtIdx - 1] : ' ';
+      if (charBeforeAt === ' ' || charBeforeAt === '\n' || lastAtIdx === 0) {
+        const filterText = textBeforeCursor.slice(lastAtIdx + 1);
+        if (!filterText.includes(' ') && !filterText.includes('\n')) {
+          setMentionPickerOpen(true);
+          setMentionFilter(filterText);
+          setMentionCursorPos(cursorPos);
+          return;
+        }
+      }
+    }
+    setMentionPickerOpen(false);
+  }, [mediaLabels]);
+
   const handleSubmit = useCallback(async () => {
     if (showFolderSelector && !workingDirectory?.trim()) {
       setShowFolderRequiredWarning(true);
@@ -506,13 +551,42 @@ const CoworkPromptInput = React.forwardRef<CoworkPromptInputRef, CoworkPromptInp
         })),
       });
     }
-    const result = await onSubmit(finalPrompt, skillPrompt, imageAtts.length > 0 ? imageAtts : undefined);
+
+    // Resolve @media tokens into MediaAttachmentRef array
+    const mediaReferences: MediaAttachmentRef[] = [];
+    const mediaTokenPattern = /@(图片|视频|音频)(\d+)/g;
+    let match: RegExpExecArray | null;
+    while ((match = mediaTokenPattern.exec(finalPrompt)) !== null) {
+      const token = match[0];
+      const label = match[1] + match[2];
+      const found = mediaLabels.find(ml => ml.label === label);
+      if (found) {
+        const ext = found.attachment.name.split('.').pop()?.toLowerCase() || '';
+        const mimeMap: Record<string, string> = {
+          jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif',
+          webp: 'image/webp', bmp: 'image/bmp', svg: 'image/svg+xml',
+          mp4: 'video/mp4', mov: 'video/quicktime', avi: 'video/x-msvideo', webm: 'video/webm', mkv: 'video/x-matroska',
+          mp3: 'audio/mpeg', wav: 'audio/wav', ogg: 'audio/ogg', flac: 'audio/flac', aac: 'audio/aac', m4a: 'audio/mp4',
+        };
+        mediaReferences.push({
+          token,
+          mediaType: found.mediaType,
+          index: found.index,
+          fileId: found.attachment.path,
+          fileName: found.attachment.name,
+          mimeType: mimeMap[ext] || `${found.mediaType}/*`,
+          localPath: found.attachment.path.startsWith('inline:') ? undefined : found.attachment.path,
+        });
+      }
+    }
+
+    const result = await onSubmit(finalPrompt, skillPrompt, imageAtts.length > 0 ? imageAtts : undefined, mediaReferences.length > 0 ? mediaReferences : undefined);
     if (result === false) return;
     setValue('');
     dispatch(setDraftPrompt({ sessionId: draftKey, draft: '' }));
     dispatch(clearDraftAttachments(draftKey));
     setImageVisionHint(false);
-  }, [value, isStreaming, disabled, isPatchingModel, onSubmit, activeSkillIds, skills, attachments, showFolderSelector, workingDirectory, dispatch, draftKey, effectiveSelectedModel?.id, modelSupportsImage]);
+  }, [value, isStreaming, disabled, isPatchingModel, onSubmit, activeSkillIds, skills, attachments, showFolderSelector, workingDirectory, dispatch, draftKey, effectiveSelectedModel?.id, modelSupportsImage, mediaLabels]);
 
   const handleSelectSkill = useCallback((skill: Skill) => {
     dispatch(toggleActiveSkill(skill.id));
@@ -1133,13 +1207,17 @@ const CoworkPromptInput = React.forwardRef<CoworkPromptInputRef, CoworkPromptInp
     <div className="relative">
       {attachments.length > 0 && (
         <div className="mb-2 flex flex-wrap gap-2 max-h-[136px] overflow-y-auto">
-          {attachments.map((attachment) => (
-            <AttachmentCard
-              key={attachment.path}
-              attachment={attachment}
-              onRemove={handleRemoveAttachment}
-            />
-          ))}
+          {attachments.map((attachment) => {
+            const ml = mediaLabels.find(m => m.attachment.path === attachment.path);
+            return (
+              <AttachmentCard
+                key={attachment.path}
+                attachment={attachment}
+                onRemove={handleRemoveAttachment}
+                label={ml?.label}
+              />
+            );
+          })}
         </div>
       )}
       {imageVisionHint && (
@@ -1176,7 +1254,7 @@ const CoworkPromptInput = React.forwardRef<CoworkPromptInputRef, CoworkPromptInp
                 <textarea
                   ref={textareaRef}
                   value={value}
-                  onChange={(e) => setValue(e.target.value)}
+                  onChange={handleTextareaChange}
                   onKeyDown={handleKeyDown}
                   onPaste={handlePaste}
                   placeholder={placeholder}
@@ -1185,11 +1263,21 @@ const CoworkPromptInput = React.forwardRef<CoworkPromptInputRef, CoworkPromptInp
                   className={textareaClass}
                   style={{ minHeight: `${minHeight}px` }}
                 />
+                {mentionPickerOpen && (
+                  <MediaMentionPicker
+                    items={mediaLabels}
+                    filter={mentionFilter}
+                    position={{ top: 8, left: 16 }}
+                    onSelect={handleMentionSelect}
+                    onDismiss={() => setMentionPickerOpen(false)}
+                  />
+                )}
                 <div className="flex items-center justify-between gap-3 px-4 pb-2 pt-1">
                   <div className="flex min-w-0 items-center gap-2">
                     {largeInputActions}
                   </div>
                   <div className="flex shrink-0 items-center gap-2">
+                    <MediaModelPicker draftKey={draftKey} disabled={disabled} />
                     {largeModelSelector}
                     {largeSendButton}
                   </div>
@@ -1277,7 +1365,7 @@ const CoworkPromptInput = React.forwardRef<CoworkPromptInputRef, CoworkPromptInp
               <textarea
                 ref={textareaRef}
                 value={value}
-                onChange={(e) => setValue(e.target.value)}
+                onChange={handleTextareaChange}
                 onKeyDown={handleKeyDown}
                 onPaste={handlePaste}
                 placeholder={placeholder}
@@ -1286,6 +1374,15 @@ const CoworkPromptInput = React.forwardRef<CoworkPromptInputRef, CoworkPromptInp
                 className={textareaClass}
                 style={{ minHeight: `${minHeight}px` }}
               />
+              {mentionPickerOpen && (
+                <MediaMentionPicker
+                  items={mediaLabels}
+                  filter={mentionFilter}
+                  position={{ top: 8, left: 16 }}
+                  onSelect={handleMentionSelect}
+                  onDismiss={() => setMentionPickerOpen(false)}
+                />
+              )}
               <div className="flex items-center justify-between px-4 pb-2 pt-1.5">
                 <div className="flex items-center gap-2 relative">
                   {showFolderSelector && (
@@ -1334,6 +1431,7 @@ const CoworkPromptInput = React.forwardRef<CoworkPromptInputRef, CoworkPromptInp
                     </>
                   )}
                   {largeModelSelector}
+                  <MediaModelPicker draftKey={draftKey} disabled={disabled} />
                   {largeInputActions}
                 </div>
                 <div className="flex items-center gap-2">
@@ -1347,7 +1445,7 @@ const CoworkPromptInput = React.forwardRef<CoworkPromptInputRef, CoworkPromptInp
             <textarea
               ref={textareaRef}
               value={value}
-              onChange={(e) => setValue(e.target.value)}
+              onChange={handleTextareaChange}
               onKeyDown={handleKeyDown}
               onPaste={handlePaste}
               placeholder={placeholder}
