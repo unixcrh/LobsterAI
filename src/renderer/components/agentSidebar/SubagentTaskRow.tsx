@@ -40,6 +40,10 @@ const SubagentTaskRow: React.FC<SubagentTaskRowProps> = ({ subagent, onSelect })
         <span className="inline-flex h-3 w-3 shrink-0 items-center justify-center">
           <LoadingIcon className="h-3 w-3 animate-spin text-secondary" aria-hidden="true" />
         </span>
+      ) : subagent.status === 'error' ? (
+        <span className="shrink-0 whitespace-nowrap text-[11px] font-normal text-red-500/60">
+          {i18nService.t('subagentError') || 'Error'}
+        </span>
       ) : (
         <span className="shrink-0 whitespace-nowrap text-[11px] font-normal text-foreground opacity-[0.28]">
           {duration}

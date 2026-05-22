@@ -49,7 +49,7 @@ export class SubagentTracker {
   /** Maps toolCallId → agentId for correlating spawn start → result */
   private readonly subagentToolCallIdToAgentId = new Map<string, string>();
   /** Maps toolCallId → lifecycle status */
-  private readonly subagentStatus = new Map<string, 'running' | 'done'>();
+  private readonly subagentStatus = new Map<string, 'running' | 'done' | 'error'>();
   /** Reverse map: agentId → Set of toolCallIds (for lookups from sessions_resume args) */
   private readonly agentIdToToolCallIds = new Map<string, Set<string>>();
 
@@ -118,6 +118,12 @@ export class SubagentTracker {
       if (toolCallId && childSessionKey && this.subagentToolCallIdToAgentId.has(toolCallId)) {
         this.subagentSessionKeys.set(toolCallId, childSessionKey);
         this.store.updateSubagentRunSessionKey(toolCallId, childSessionKey);
+      }
+      // Mark as error if the spawn result indicates failure
+      if (toolCallId && parsed?.status === 'error' && this.subagentToolCallIdToAgentId.has(toolCallId)) {
+        this.subagentStatus.set(toolCallId, 'error');
+        this.store.updateSubagentRunStatus(toolCallId, 'error', Date.now());
+        console.log('[SubagentTracker] subagent spawn failed:', toolCallId, parsed.error);
       }
     } catch { /* result may not be JSON */ }
   }
