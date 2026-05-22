@@ -48,7 +48,7 @@ const MyAgentSidebarTree: React.FC<MyAgentSidebarTreeProps> = ({
   const [isCreateOpen, setIsCreateOpen] = useState(false);
   const [settingsAgentId, setSettingsAgentId] = useState<string | null>(null);
   const [selectedSubagentId, setSelectedSubagentId] = useState<string | null>(null);
-  const { subagentsBySessionId } = useSubagentSessions(currentSessionId, currentSessionStatus);
+  const { subagentsBySessionId, refetchSubagents } = useSubagentSessions(currentSessionId, currentSessionStatus);
   const {
     agentNodes,
     patchTaskPreview,
@@ -70,10 +70,14 @@ const MyAgentSidebarTree: React.FC<MyAgentSidebarTreeProps> = ({
     const handler = (event: Event) => {
       const detail = (event as CustomEvent<SubagentSessionSummary | null>).detail;
       setSelectedSubagentId(detail?.id ?? null);
+      // Refetch subagent data when navigating back from detail view
+      if (!detail && currentSessionId) {
+        void refetchSubagents(currentSessionId);
+      }
     };
     window.addEventListener(CoworkUiEvent.SelectSubagent, handler);
     return () => window.removeEventListener(CoworkUiEvent.SelectSubagent, handler);
-  }, []);
+  }, [currentSessionId, refetchSubagents]);
 
   const handleSelectTask = async (task: AgentSidebarTaskNode) => {
     if (task.agentId !== currentAgentId) {
