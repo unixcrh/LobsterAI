@@ -3810,7 +3810,31 @@ if (!gotTheLock) {
 
   ipcMain.handle('skills:delete', async (_event, id: string) => {
     try {
+      // Read _meta.json before deletion to get OpenClaw source path
+      let openclawSourceDir: string | null = null;
+      try {
+        const skillRoot = getSkillManager().getSkillsRoot();
+        const metaPath = path.join(skillRoot, id, '_meta.json');
+        if (fs.existsSync(metaPath)) {
+          const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+          if (meta.openclawSourceDir) {
+            openclawSourceDir = meta.openclawSourceDir;
+          }
+        }
+      } catch { /* best-effort */ }
+
       const skills = await getSkillManager().deleteSkill(id);
+
+      // Also remove from OpenClaw workspace so the skill won't reappear on next sync
+      if (openclawSourceDir && fs.existsSync(openclawSourceDir)) {
+        try {
+          await fs.promises.rm(openclawSourceDir, { recursive: true, force: true });
+          console.log('[skills] Also removed OpenClaw workspace skill:', openclawSourceDir);
+        } catch (ocError) {
+          console.warn('[skills] Failed to remove skill from OpenClaw workspace:', ocError);
+        }
+      }
+
       return { success: true, skills };
     } catch (error) {
       console.error('[skills] Failed to delete skill:', id, error);
