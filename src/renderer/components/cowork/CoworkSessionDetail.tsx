@@ -2021,14 +2021,11 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
       const alwaysRender = index >= turns.length - 3;
 
       // Compute rail indices for user/assistant messages (must match rail IIFE logic)
-      let asstContent = '';
-      for (const item of turn.assistantItems) {
-        if (item.type === 'assistant' && item.message?.content) {
-          asstContent += item.message.content;
-        }
-      }
+      const hasAssistantContent = turn.assistantItems.some(
+        item => item.type === 'assistant' && Boolean(item.message?.content),
+      );
       const userRailIdx = turn.userMessage ? railCounter++ : -1;
-      const asstRailIdx = asstContent ? railCounter++ : -1;
+      const asstRailIdx = hasAssistantContent ? railCounter++ : -1;
 
       const turnMessageIds = new Set<string>();
       for (const item of turn.assistantItems) {
