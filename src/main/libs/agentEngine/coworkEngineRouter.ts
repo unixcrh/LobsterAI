@@ -98,11 +98,11 @@ export class CoworkEngineRouter extends EventEmitter implements CoworkRuntime {
     return this.runtime.compactContext(sessionId);
   }
 
-  async getForkCompactionSummary(sessionId: string): Promise<CoworkForkCompactionSummary | null> {
+  async getForkCompactionSummary(sessionId: string, beforeCreatedAt?: number): Promise<CoworkForkCompactionSummary | null> {
     if (!this.runtime.getForkCompactionSummary) {
       return null;
     }
-    return this.runtime.getForkCompactionSummary(sessionId);
+    return this.runtime.getForkCompactionSummary(sessionId, beforeCreatedAt);
   }
 
   stopSession(sessionId: string): void {

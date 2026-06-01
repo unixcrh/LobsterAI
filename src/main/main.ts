@@ -5194,8 +5194,15 @@ if (!gotTheLock) {
           return { success: false, error: 'Please stop the current task before forking it.' };
         }
 
+        const forkedFromMessageId = options?.forkedFromMessageId?.trim() || null;
+        const forkedFromTimestamp = forkedFromMessageId
+          ? coworkStoreInstance.getMessageTimestamp(sessionId, forkedFromMessageId)
+          : null;
         const forkContextMessages: CoworkForkContextMessage[] = [];
-        const compactionSummary = await runtime.getForkCompactionSummary(sessionId);
+        const compactionSummary = await runtime.getForkCompactionSummary(
+          sessionId,
+          forkedFromTimestamp ?? undefined,
+        );
         if (compactionSummary) {
           forkContextMessages.push({
             content: compactionSummary.summary,
@@ -5211,18 +5218,18 @@ if (!gotTheLock) {
               truncated: compactionSummary.truncated === true,
             },
           });
-          console.log('[CoworkFork] attached a compaction summary bridge to the fork');
+          console.log(`[CoworkFork] attached a compaction summary bridge from source session ${sessionId}`);
         }
 
-        console.log('[CoworkFork] creating a local conversation fork');
+        console.log(`[CoworkFork] creating a local conversation fork from session ${sessionId}`);
         const session = coworkStoreInstance.forkSession({
           sourceSessionId: sessionId,
           forkMode: CoworkForkMode.Conversation,
-          forkedFromMessageId: options?.forkedFromMessageId ?? null,
+          forkedFromMessageId,
           title: options?.title,
           contextMessages: forkContextMessages,
         });
-        console.log('[CoworkFork] created a local conversation fork successfully');
+        console.log(`[CoworkFork] created local conversation fork ${session.id} successfully`);
         return { success: true, session };
       } catch (error) {
         console.error('[CoworkFork] failed to fork session:', error);

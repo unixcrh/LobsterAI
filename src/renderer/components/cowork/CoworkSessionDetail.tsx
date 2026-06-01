@@ -634,7 +634,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
       return;
     }
 
-    console.log('[CoworkFork] requesting a fork from an assistant message action');
+    console.log(`[CoworkFork] requesting a fork from assistant message ${messageId} in session ${currentSession.id}`);
     void coworkService.forkSession({
       sessionId: currentSession.id,
       forkedFromMessageId: messageId,

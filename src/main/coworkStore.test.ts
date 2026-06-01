@@ -468,6 +468,67 @@ test('forkSession skips compaction bridge messages newer than the fork point', (
   ))).toBe(true);
 });
 
+test('forkSession inherits one compaction bridge message when a fork is forked again', () => {
+  const sid = 'sess-fork-compaction-inheritance';
+  insertSession(sid);
+  insertMessage('msg-answer', sid, 'assistant', 'original answer', null, 1, 1000);
+
+  const firstFork = store.forkSession({
+    sourceSessionId: sid,
+    contextMessages: [{
+      content: 'Inherited compacted context.',
+      metadata: {
+        kind: CoworkSystemMessageKind.ForkCompactionSummary,
+        checkpointCreatedAt: 500,
+      },
+    }],
+  });
+
+  const secondFork = store.forkSession({
+    sourceSessionId: firstFork.id,
+    forkedFromMessageId: firstFork.messages.find((message) => message.content === 'original answer')?.id,
+  });
+  const summaries = secondFork.messages.filter((message) => (
+    message.metadata?.kind === CoworkSystemMessageKind.ForkCompactionSummary
+  ));
+
+  expect(summaries).toHaveLength(1);
+  expect(summaries[0].content).toBe('Inherited compacted context.');
+});
+
+test('forkSession prefers a new compaction bridge over an inherited summary', () => {
+  const sid = 'sess-fork-compaction-replacement';
+  insertSession(sid);
+  insertMessage('msg-answer', sid, 'assistant', 'original answer', null, 1, 1000);
+
+  const firstFork = store.forkSession({
+    sourceSessionId: sid,
+    contextMessages: [{
+      content: 'Older compacted context.',
+      metadata: {
+        kind: CoworkSystemMessageKind.ForkCompactionSummary,
+        checkpointCreatedAt: 500,
+      },
+    }],
+  });
+  const secondFork = store.forkSession({
+    sourceSessionId: firstFork.id,
+    contextMessages: [{
+      content: 'Newer compacted context.',
+      metadata: {
+        kind: CoworkSystemMessageKind.ForkCompactionSummary,
+        checkpointCreatedAt: 1500,
+      },
+    }],
+  });
+  const summaries = secondFork.messages.filter((message) => (
+    message.metadata?.kind === CoworkSystemMessageKind.ForkCompactionSummary
+  ));
+
+  expect(summaries).toHaveLength(1);
+  expect(summaries[0].content).toBe('Newer compacted context.');
+});
+
 test('agent CRUD stores working directory independently', () => {
   const agent = store.createAgent({
     name: 'Docs Agent',

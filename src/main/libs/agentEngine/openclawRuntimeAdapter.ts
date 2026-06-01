@@ -1917,7 +1917,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
     return { compacted, ...(reason ? { reason } : {}), usage };
   }
 
-  async getForkCompactionSummary(sessionId: string): Promise<CoworkForkCompactionSummary | null> {
+  async getForkCompactionSummary(sessionId: string, beforeCreatedAt?: number): Promise<CoworkForkCompactionSummary | null> {
     const client = this.gatewayClient;
     if (!client) {
       console.debug(`[OpenClawRuntime] skipped fork compaction lookup for session ${sessionId} because the gateway client is unavailable.`);
@@ -1936,10 +1936,15 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
           : Array.isArray(listResult?.checkpoints)
             ? listResult.checkpoints
             : [];
-        const latest = checkpoints
+        const eligibleCheckpoints = typeof beforeCreatedAt === 'number'
+          ? checkpoints.filter((checkpoint) => (
+            typeof checkpoint.createdAt === 'number' && checkpoint.createdAt <= beforeCreatedAt
+          ))
+          : checkpoints;
+        const latest = eligibleCheckpoints
           .filter((checkpoint) => typeof checkpoint?.summary === 'string' && checkpoint.summary.trim())
           .sort((left, right) => (right.createdAt ?? 0) - (left.createdAt ?? 0))[0]
-          ?? checkpoints
+          ?? eligibleCheckpoints
             .filter((checkpoint) => typeof checkpoint?.checkpointId === 'string' && checkpoint.checkpointId.trim())
             .sort((left, right) => (right.createdAt ?? 0) - (left.createdAt ?? 0))[0];
 
@@ -3069,6 +3074,9 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
         '[OpenClaw compaction summary from the fork source]',
         truncate(summary, FORK_COMPACTION_SUMMARY_MAX_CHARS),
       );
+    }
+    if (compactionSummaries.length > 0) {
+      console.debug(`[OpenClawRuntime] injected ${compactionSummaries.length} fork compaction summary bridge message(s).`);
     }
 
     const lines = recent.map((entry) => {

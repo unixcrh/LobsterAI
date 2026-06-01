@@ -164,6 +164,40 @@ test('bridge prefix can rely only on a hidden fork compaction summary', () => {
   expect(bridge).toContain('original design constraints');
 });
 
+test('fork compaction lookup selects the latest checkpoint before the fork point', async () => {
+  const session = {
+    id: 'fork-checkpoint-boundary',
+    agentId: 'main',
+  };
+  const adapter = new OpenClawRuntimeAdapter({
+    getSession: (sessionId: string) => (sessionId === session.id ? session : null),
+  } as never, {} as never);
+  adapter.gatewayClient = {
+    request: async () => ({
+      checkpoints: [
+        {
+          checkpointId: 'checkpoint-new',
+          createdAt: 3000,
+          summary: 'Newer summary after the selected fork point.',
+        },
+        {
+          checkpointId: 'checkpoint-old',
+          createdAt: 1000,
+          summary: 'Older summary before the selected fork point.',
+        },
+      ],
+    }),
+  } as never;
+
+  const summary = await adapter.getForkCompactionSummary(session.id, 2000);
+
+  expect(summary).toMatchObject({
+    checkpointId: 'checkpoint-old',
+    createdAt: 1000,
+    summary: 'Older summary before the selected fork point.',
+  });
+});
+
 test('context usage resolves historical sessions with targeted lookup', async () => {
   const session = {
     id: 'session-1',

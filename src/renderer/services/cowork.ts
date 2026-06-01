@@ -799,13 +799,13 @@ class CoworkService {
       return { session: null, error: 'Cowork fork API is unavailable' };
     }
 
-    console.log('[CoworkFork] requesting a local conversation fork from the renderer');
+    console.log(`[CoworkFork] requesting a local conversation fork for session ${options.sessionId}`);
     try {
       const result = await cowork.forkSession(options);
       if (result.success && result.session) {
         store.dispatch(addSession(result.session));
         store.dispatch(setStreaming(false));
-        console.log('[CoworkFork] renderer received a forked session successfully');
+        console.log(`[CoworkFork] renderer received forked session ${result.session.id} successfully`);
         window.dispatchEvent(new CustomEvent('app:showToast', {
           detail: i18nService.t('coworkForkCreated'),
         }));
@@ -814,7 +814,7 @@ class CoworkService {
 
       const error = result.error || i18nService.t('coworkForkFailed');
       window.dispatchEvent(new CustomEvent('app:showToast', { detail: error }));
-      console.warn('[CoworkFork] renderer fork request was rejected');
+      console.warn(`[CoworkFork] renderer fork request for session ${options.sessionId} was rejected`);
       return { session: null, error };
     } catch (error) {
       const message = error instanceof Error ? error.message : i18nService.t('coworkForkFailed');

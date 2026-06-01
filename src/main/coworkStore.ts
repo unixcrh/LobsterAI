@@ -855,6 +855,11 @@ export class CoworkStore {
     }
 
     const sourceMessages = this.getForkSourceMessages(options.sourceSessionId, messageLimitSequence);
+    const contextMessages = this.getForkContextMessages(
+      options.sourceSessionId,
+      options.contextMessages ?? [],
+      forkBoundary,
+    );
     const insertSession = this.db.prepare(
       `
       INSERT INTO cowork_sessions (
@@ -895,8 +900,7 @@ export class CoworkStore {
         now,
       );
 
-      for (const contextMessage of options.contextMessages ?? []) {
-        if (!this.shouldCopyForkContextMessage(contextMessage, forkBoundary)) continue;
+      for (const contextMessage of contextMessages) {
         const content = contextMessage.content.trim();
         if (!content) continue;
         insertMessage.run(
@@ -945,6 +949,10 @@ export class CoworkStore {
     };
   }
 
+  getMessageTimestamp(sessionId: string, messageId: string): number | null {
+    return this.getMessageForkBoundary(sessionId, messageId)?.createdAt ?? null;
+  }
+
   private shouldCopyForkContextMessage(
     message: CoworkForkContextMessage,
     forkBoundary: CoworkForkBoundary | null,
@@ -952,6 +960,42 @@ export class CoworkStore {
     if (!forkBoundary) return true;
     const checkpointCreatedAt = message.metadata.checkpointCreatedAt;
     return typeof checkpointCreatedAt === 'number' && checkpointCreatedAt <= forkBoundary.createdAt;
+  }
+
+  private getForkContextMessages(
+    sourceSessionId: string,
+    providedMessages: CoworkForkContextMessage[],
+    forkBoundary: CoworkForkBoundary | null,
+  ): CoworkForkContextMessage[] {
+    const provided = providedMessages.find((message) => (
+      message.content.trim() && this.shouldCopyForkContextMessage(message, forkBoundary)
+    ));
+    if (provided) return [provided];
+
+    const rows = this.getAll<CoworkMessageRow>(
+      `
+      SELECT id, type, content, metadata, created_at, sequence
+      FROM cowork_messages
+      WHERE session_id = ? AND type = 'system'
+      ORDER BY created_at DESC, ROWID DESC
+    `,
+      [sourceSessionId],
+    );
+
+    for (const row of rows) {
+      if (!row.metadata || !row.content.trim()) continue;
+      try {
+        const metadata = JSON.parse(row.metadata) as CoworkMessageMetadata;
+        if (metadata.kind !== CoworkSystemMessageKind.ForkCompactionSummary) continue;
+        const inherited = { content: row.content, metadata };
+        if (this.shouldCopyForkContextMessage(inherited, forkBoundary)) {
+          return [inherited];
+        }
+      } catch {
+        // Ignore malformed hidden context metadata and continue copying visible history.
+      }
+    }
+    return [];
   }
 
   private getForkSourceMessages(sessionId: string, maxSequence: number | null): CoworkMessageRow[] {
@@ -971,11 +1015,13 @@ export class CoworkStore {
   }
 
   private shouldCopyForkMessage(row: CoworkMessageRow): boolean {
-    if (row.type !== 'assistant') return true;
     if (!row.metadata) return true;
     try {
       const metadata = JSON.parse(row.metadata) as CoworkMessageMetadata;
-      return metadata.isStreaming !== true;
+      if (metadata.kind === CoworkSystemMessageKind.ForkCompactionSummary) {
+        return false;
+      }
+      return row.type !== 'assistant' || metadata.isStreaming !== true;
     } catch {
       return true;
     }
