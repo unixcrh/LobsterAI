@@ -52,6 +52,10 @@ import {
   CoworkForkMode,
   CoworkIpcChannel,
 } from '../shared/cowork/constants';
+import {
+  type CoworkSelectedTextSnippet,
+  normalizeCoworkSelectedTextSnippets,
+} from '../shared/cowork/selectedText';
 import { DialogIpc } from '../shared/dialog/constants';
 import {
   HtmlShareAccessMode,
@@ -2385,6 +2389,7 @@ function buildCoworkUserSelectionMetadata(options: {
   kitReferences?: KitReference[];
   resolvedKitCapabilities?: ResolvedKitCapabilities;
   imageAttachments?: CoworkImageAttachmentMain[];
+  selectedTextSnippets?: CoworkSelectedTextSnippet[];
 }): Record<string, unknown> | undefined {
   const metadata: Record<string, unknown> = {};
 
@@ -2403,8 +2408,19 @@ function buildCoworkUserSelectionMetadata(options: {
   if (options.imageAttachments?.length) {
     metadata.imageAttachments = options.imageAttachments;
   }
+  if (options.selectedTextSnippets?.length) {
+    metadata.selectedTextSnippets = options.selectedTextSnippets;
+  }
 
   return Object.keys(metadata).length > 0 ? metadata : undefined;
+}
+
+function normalizeSelectedTextSnippetsForIpc(value: unknown): CoworkSelectedTextSnippet[] {
+  const result = normalizeCoworkSelectedTextSnippets(value);
+  if (!result.success) {
+    throw new Error(`Invalid selected text snippets: ${result.error}`);
+  }
+  return result.snippets;
 }
 
 // 获取正确的预加载脚本路径
@@ -4864,6 +4880,7 @@ if (!gotTheLock) {
           videoModelId?: string;
         };
         mediaReferences?: MediaAttachmentRefMain[];
+        selectedTextSnippets?: CoworkSelectedTextSnippet[];
       },
     ) => {
       try {
@@ -4894,6 +4911,13 @@ if (!gotTheLock) {
         const title = options.title?.trim() || fallbackTitle;
         const taskWorkingDirectory = resolveTaskWorkingDirectory(selectedTaskDirectory);
         const runtimeSkillIds = options.runtimeSkillIds ?? options.activeSkillIds;
+        const selectedTextSnippets = normalizeSelectedTextSnippetsForIpc(options.selectedTextSnippets);
+        if (selectedTextSnippets.length > 0) {
+          console.log(
+            `[CoworkSelectedText] accepted ${selectedTextSnippets.length} excerpts with `
+            + `${selectedTextSnippets.reduce((total, snippet) => total + snippet.text.length, 0)} characters for a new session`,
+          );
+        }
 
         const session = coworkStoreInstance.createSession(
           title,
@@ -4941,6 +4965,7 @@ if (!gotTheLock) {
           kitReferences: options.kitReferences,
           resolvedKitCapabilities: options.resolvedKitCapabilities,
           imageAttachments: options.imageAttachments,
+          selectedTextSnippets,
         });
         coworkStoreInstance.addMessage(session.id, {
           type: 'user',
@@ -4966,6 +4991,7 @@ if (!gotTheLock) {
             agentId: options.agentId,
             mediaSelection: options.mediaSelection,
             mediaReferences: options.mediaReferences,
+            selectedTextSnippets,
           })
           .catch(error => {
             console.error('[Cowork] session error:', error);
@@ -5025,6 +5051,7 @@ if (!gotTheLock) {
           videoModelId?: string;
         };
         mediaReferences?: MediaAttachmentRefMain[];
+        selectedTextSnippets?: CoworkSelectedTextSnippet[];
       },
     ) => {
       try {
@@ -5035,6 +5062,13 @@ if (!gotTheLock) {
 
         const runtime = getCoworkEngineRouter();
         const existingSession = getCoworkStore().getSession(options.sessionId);
+        const selectedTextSnippets = normalizeSelectedTextSnippetsForIpc(options.selectedTextSnippets);
+        if (selectedTextSnippets.length > 0) {
+          console.log(
+            `[CoworkSelectedText] accepted ${selectedTextSnippets.length} excerpts with `
+            + `${selectedTextSnippets.reduce((total, snippet) => total + snippet.text.length, 0)} characters for session ${options.sessionId}`,
+          );
+        }
 
         if (options.mediaSelection && options.mediaSelection.mode !== 'none') {
           mediaSelectionBySession.set(options.sessionId, options.mediaSelection);
@@ -5073,6 +5107,7 @@ if (!gotTheLock) {
             imageAttachments: options.imageAttachments,
             mediaSelection: options.mediaSelection,
             mediaReferences: options.mediaReferences,
+            selectedTextSnippets,
           })
           .catch(error => {
             console.error('[Cowork] continue error:', error);

@@ -3,6 +3,7 @@ import type {
   CoworkContextUsageSource,
   CoworkForkMode,
 } from '../../shared/cowork/constants';
+import type { CoworkSelectedTextSnippet } from '../../shared/cowork/selectedText';
 import type {
   KitReference,
   ResolvedKitCapabilities,
@@ -71,6 +72,7 @@ export interface CoworkMessageMetadata {
   contextPercent?: number;
   model?: string;
   agentName?: string;
+  selectedTextSnippets?: CoworkSelectedTextSnippet[];
   [key: string]: unknown;
 }
 
@@ -306,6 +308,7 @@ export interface CoworkStartOptions {
   imageAttachments?: CoworkImageAttachment[];
   mediaSelection?: { mode: string; modelId?: string; modelName?: string; imageModelId?: string; videoModelId?: string };
   mediaReferences?: import('./mediaGeneration').MediaAttachmentRef[];
+  selectedTextSnippets?: CoworkSelectedTextSnippet[];
 }
 
 // Continue session options
@@ -321,6 +324,7 @@ export interface CoworkContinueOptions {
   imageAttachments?: CoworkImageAttachment[];
   mediaSelection?: { mode: string; modelId?: string; modelName?: string; imageModelId?: string; videoModelId?: string };
   mediaReferences?: import('./mediaGeneration').MediaAttachmentRef[];
+  selectedTextSnippets?: CoworkSelectedTextSnippet[];
 }
 
 // IPC result types

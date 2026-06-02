@@ -6,6 +6,12 @@ import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useSta
 import { createPortal } from 'react-dom';
 import { useDispatch, useSelector } from 'react-redux';
 
+import {
+  type CoworkSelectedTextSnippet,
+  CoworkSelectedTextSource,
+  type CoworkSelectedTextValidationError,
+  normalizeCoworkSelectedTextSnippets,
+} from '../../../shared/cowork/selectedText';
 import { dedupeArtifactsForDisplay, normalizeFilePathForDedup, normalizeLocalServiceUrlForDedup, parseFileLinksFromMessage, parseFilePathsFromText, parseLocalServiceUrlsFromText, parseMediaTokensFromText, parseRemoteImageArtifactsFromText, parseToolArtifact, parseToolResultMediaArtifacts, shouldParseFilePathsFromToolResult, stripFileLinksFromText } from '../../services/artifactParser';
 import { coworkService } from '../../services/cowork';
 import { i18nService } from '../../services/i18n';
@@ -33,6 +39,7 @@ import {
   selectPanelWidth,
   togglePanel,
 } from '../../store/slices/artifactSlice';
+import { addDraftSelectedTextSnippet } from '../../store/slices/coworkSlice';
 import { setActiveKitIds } from '../../store/slices/kitSlice';
 import { setActiveSkillIds } from '../../store/slices/skillSlice';
 import type { Artifact } from '../../types/artifact';
@@ -61,7 +68,7 @@ import UserMessageItem from './UserMessageItem';
 interface CoworkSessionDetailProps {
   onManageSkills?: () => void;
   onManageKits?: () => void;
-  onContinue: (prompt: string, skillPrompt?: string, imageAttachments?: CoworkImageAttachment[], mediaReferences?: MediaAttachmentRef[]) => boolean | void | Promise<boolean | void>;
+  onContinue: (prompt: string, skillPrompt?: string, imageAttachments?: CoworkImageAttachment[], mediaReferences?: MediaAttachmentRef[], selectedTextSnippets?: CoworkSelectedTextSnippet[]) => boolean | void | Promise<boolean | void>;
   onStop: () => void;
   isSidebarCollapsed?: boolean;
   onToggleSidebar?: () => void;
@@ -77,6 +84,14 @@ const ARTIFACT_PANEL_RESIZE_HANDLE_WIDTH = 4;
 const COWORK_DETAIL_MIN_WIDTH = 480;
 const ARTIFACT_PANEL_MIN_WIDTH_RATIO = 1 / 6;
 const INVALID_FILE_NAME_PATTERN = /[<>:"/\\|?*\u0000-\u001F]/g;
+const SELECTED_TEXT_ERROR_I18N_KEYS: Record<CoworkSelectedTextValidationError, string> = {
+  empty: 'coworkSelectedTextInvalid',
+  invalid: 'coworkSelectedTextInvalid',
+  too_long: 'coworkSelectedTextTooLong',
+  too_many: 'coworkSelectedTextTooMany',
+  total_too_long: 'coworkSelectedTextTotalTooLong',
+  duplicate: 'coworkSelectedTextDuplicate',
+};
 
 const sanitizeExportFileName = (value: string): string => {
   const sanitized = value.replace(INVALID_FILE_NAME_PATTERN, ' ').replace(/\s+/g, ' ').trim();
@@ -514,6 +529,9 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
   const messagesLength = useSelector(selectCurrentMessagesLength);
   const skills = useSelector((state: RootState) => state.skill.skills);
   const marketplaceKits = useSelector((state: RootState) => state.kit.marketplaceKits);
+  const selectedDraftSnippets = useSelector((state: RootState) =>
+    currentSession?.id ? state.cowork.draftSelectedTextSnippets[currentSession.id] ?? [] : []
+  );
   const contextUsage = useSelector((state: RootState) =>
     currentSession?.id ? state.cowork.contextUsageBySessionId[currentSession.id] : undefined
   );
@@ -532,6 +550,12 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
   const [shouldAutoScroll, setShouldAutoScroll] = useState(true);
   const [isLoadingMoreMessages, setIsLoadingMoreMessages] = useState(false);
   const [showCompactConfirm, setShowCompactConfirm] = useState(false);
+  const [selectedTextAction, setSelectedTextAction] = useState<{
+    text: string;
+    sourceMessageId: string;
+    left: number;
+    top: number;
+  } | null>(null);
   const isLoadingMoreMessagesRef = useRef(false);
   const prevScrollHeightRef = useRef<number | null>(null);
 
@@ -544,6 +568,19 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
   useEffect(() => {
     setShowCompactConfirm(false);
   }, [sessionId]);
+
+  useEffect(() => {
+    if (!selectedTextAction) return undefined;
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target;
+      if (target instanceof Element && target.closest('[data-cowork-selected-text-action]')) {
+        return;
+      }
+      setSelectedTextAction(null);
+    };
+    document.addEventListener('pointerdown', handlePointerDown);
+    return () => document.removeEventListener('pointerdown', handlePointerDown);
+  }, [selectedTextAction]);
 
   useEffect(() => {
     if (!showCompactConfirm) return undefined;
@@ -647,6 +684,77 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
       forkedFromMessageId: messageId,
     });
   }, [currentSession?.id, currentSession?.status, isStreaming]);
+
+  const handleAssistantTextSelection = useCallback(() => {
+    if (remoteManaged) return;
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
+      setSelectedTextAction(null);
+      return;
+    }
+    const range = selection.getRangeAt(0);
+    const startElement = range.startContainer.parentElement;
+    const endElement = range.endContainer.parentElement;
+    const startMessage = startElement?.closest<HTMLElement>('[data-cowork-assistant-message-id]');
+    const endMessage = endElement?.closest<HTMLElement>('[data-cowork-assistant-message-id]');
+    const sourceMessageId = startMessage?.dataset.coworkAssistantMessageId;
+    const text = selection.toString().trim();
+    if (!sourceMessageId || startMessage !== endMessage || !text) {
+      setSelectedTextAction(null);
+      return;
+    }
+    const rect = range.getBoundingClientRect();
+    setSelectedTextAction({
+      text,
+      sourceMessageId,
+      left: Math.min(window.innerWidth - 140, Math.max(8, rect.left)),
+      top: Math.max(8, rect.top - 42),
+    });
+  }, [remoteManaged]);
+
+  const handleAddSelectedText = useCallback(() => {
+    if (!currentSession?.id || !selectedTextAction) return;
+    const snippet: CoworkSelectedTextSnippet = {
+      id: `selected-text-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      text: selectedTextAction.text,
+      sourceMessageId: selectedTextAction.sourceMessageId,
+      sourceMessageType: CoworkSelectedTextSource.AssistantMessage,
+      createdAt: Date.now(),
+    };
+    const result = normalizeCoworkSelectedTextSnippets([...selectedDraftSnippets, snippet]);
+    if (!result.success) {
+      window.dispatchEvent(new CustomEvent('app:showToast', {
+        detail: i18nService.t(SELECTED_TEXT_ERROR_I18N_KEYS[result.error]),
+      }));
+      return;
+    }
+    dispatch(addDraftSelectedTextSnippet({ draftKey: currentSession.id, snippet }));
+    logDetailDiagnostic(
+      `added a selected text excerpt to the draft for session ${currentSession.id}; `
+      + `${result.snippets.length} excerpts now contain ${result.snippets.reduce((total, item) => total + item.text.length, 0)} characters`,
+    );
+    window.getSelection()?.removeAllRanges();
+    setSelectedTextAction(null);
+    promptInputRef.current?.focus();
+  }, [currentSession?.id, dispatch, selectedDraftSnippets, selectedTextAction]);
+
+  const handleLocateSelectedText = useCallback((sourceMessageId: string) => {
+    const container = scrollContainerRef.current;
+    const element = Array.from(
+      container?.querySelectorAll<HTMLElement>('[data-cowork-assistant-message-id]') ?? [],
+    ).find(candidate => candidate.dataset.coworkAssistantMessageId === sourceMessageId);
+    if (!element) {
+      window.dispatchEvent(new CustomEvent('app:showToast', {
+        detail: i18nService.t('coworkSelectedTextSourceUnavailable'),
+      }));
+      return;
+    }
+    element.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    element.classList.add('ring-2', 'ring-primary/50', 'rounded-lg');
+    window.setTimeout(() => {
+      element.classList.remove('ring-2', 'ring-primary/50', 'rounded-lg');
+    }, 1600);
+  }, []);
 
   // ─── Artifact detection ─────────────────────────────────────────────
   const isPanelOpen = useSelector((state: RootState) => selectIsPanelOpen(state, sessionId));
@@ -1497,6 +1605,14 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
       if (msg.type === 'user') {
         lines.push(`## 🧑 User`);
         lines.push('');
+        if (msg.metadata?.selectedTextSnippets?.length) {
+          lines.push(`### ${i18nService.t('coworkSelectedTextExportHeading')}`);
+          lines.push('');
+          for (const snippet of msg.metadata.selectedTextSnippets) {
+            lines.push(...snippet.text.split('\n').map(line => `> ${line}`));
+            lines.push('');
+          }
+        }
         lines.push(msg.content);
         lines.push('');
       } else if (msg.type === 'assistant') {
@@ -1538,6 +1654,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
         timestamp: new Date(msg.timestamp).toISOString(),
         ...(msg.metadata?.toolName ? { toolName: msg.metadata.toolName } : {}),
         ...(msg.metadata?.toolInput ? { toolInput: msg.metadata.toolInput } : {}),
+        ...(msg.metadata?.selectedTextSnippets?.length ? { selectedTextSnippets: msg.metadata.selectedTextSnippets } : {}),
       })),
     }, null, 2);
   }, [currentSession]);
@@ -1733,6 +1850,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
   const handleMessagesScroll = useCallback(() => {
     const container = scrollContainerRef.current;
     if (!container) return;
+    setSelectedTextAction(null);
     const distanceToBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
     const isNearBottom = distanceToBottom <= AUTO_SCROLL_THRESHOLD;
     setShouldAutoScroll((prev) => (prev === isNearBottom ? prev : isNearBottom));
@@ -1936,6 +2054,8 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
     // Restore image attachments (always call to clear previous attachments)
     const imageAttachments = ((message.metadata as CoworkMessageMetadata)?.imageAttachments ?? []) as CoworkImageAttachment[];
     ref.setImageAttachments(imageAttachments);
+    const selectedTextSnippets = ((message.metadata as CoworkMessageMetadata)?.selectedTextSnippets ?? []) as CoworkSelectedTextSnippet[];
+    ref.setSelectedTextSnippets(selectedTextSnippets);
     // Restore active skills
     const skillIds = (message.metadata as CoworkMessageMetadata)?.skillIds ?? [];
     dispatch(setActiveSkillIds(skillIds));
@@ -2086,6 +2206,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
                 skills={skills}
                 marketplaceKits={marketplaceKits}
                 onReEdit={remoteManaged ? undefined : handleReEdit}
+                onLocateSelectedText={handleLocateSelectedText}
               />
             </div>
           )}
@@ -2110,6 +2231,18 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
 
   return (
     <div className="flex-1 flex flex-col h-full overflow-hidden">
+      {selectedTextAction && createPortal(
+        <button
+          type="button"
+          data-cowork-selected-text-action
+          onClick={handleAddSelectedText}
+          className="fixed z-[100] rounded-full border border-border bg-surface px-3 py-1.5 text-xs font-medium text-foreground shadow-popover transition-colors hover:bg-surface-raised"
+          style={{ left: selectedTextAction.left, top: selectedTextAction.top }}
+        >
+          {i18nService.t('coworkSelectedTextAddToChat')}
+        </button>,
+        document.body
+      )}
       {/* Header — spans full width */}
       <div className="draggable flex h-12 items-center justify-between px-4 border-b border-border bg-background shrink-0">
         {/* Left side: Toggle buttons (when collapsed) + Title */}
@@ -2422,6 +2555,7 @@ const CoworkSessionDetail: React.FC<CoworkSessionDetailProps> = ({
         <div
           ref={scrollContainerRef}
           onScroll={handleMessagesScroll}
+          onMouseUp={handleAssistantTextSelection}
           className="h-full min-h-0 overflow-y-auto pt-3"
           style={{ scrollbarGutter: 'stable both-edges' }}
         >
