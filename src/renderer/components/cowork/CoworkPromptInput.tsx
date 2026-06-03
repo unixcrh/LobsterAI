@@ -1468,7 +1468,6 @@ const CoworkPromptInput = React.forwardRef<CoworkPromptInputRef, CoworkPromptInp
       <SelectedTextSnippetBadge
         snippets={selectedTextSnippets}
         onRemove={(snippetId) => dispatch(removeDraftSelectedTextSnippet({ draftKey, snippetId }))}
-        onClear={() => dispatch(clearDraftSelectedTextSnippets(draftKey))}
       />
     </div>
   ) : null;
