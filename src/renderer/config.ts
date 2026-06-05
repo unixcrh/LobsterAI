@@ -5,6 +5,53 @@ import {
   defaultBrowserWebAccessConfig,
 } from '../shared/browserWebAccess/constants';
 
+export const ShortcutAction = {
+  NewChat: 'newChat',
+  Search: 'search',
+  Settings: 'settings',
+  SendMessage: 'sendMessage',
+  ShowShortcuts: 'showShortcuts',
+  FocusPrompt: 'focusPrompt',
+  StopCurrentTask: 'stopCurrentTask',
+  ToggleSidebar: 'toggleSidebar',
+  ToggleArtifacts: 'toggleArtifacts',
+  PreviousAgent: 'previousAgent',
+  NextAgent: 'nextAgent',
+  ShowCurrentAgentTasks: 'showCurrentAgentTasks',
+  OpenAgentTask1: 'openAgentTask1',
+  OpenAgentTask2: 'openAgentTask2',
+  OpenAgentTask3: 'openAgentTask3',
+  OpenAgentTask4: 'openAgentTask4',
+  OpenAgentTask5: 'openAgentTask5',
+  OpenAgentTask6: 'openAgentTask6',
+  OpenAgentTask7: 'openAgentTask7',
+  OpenAgentTask8: 'openAgentTask8',
+  OpenAgentTask9: 'openAgentTask9',
+  OpenCowork: 'openCowork',
+  OpenScheduledTasks: 'openScheduledTasks',
+  OpenKits: 'openKits',
+  OpenSkills: 'openSkills',
+  OpenMcp: 'openMcp',
+  OpenSettingsGeneral: 'openSettingsGeneral',
+  OpenSettingsAppearance: 'openSettingsAppearance',
+  OpenSettingsAgentEngine: 'openSettingsAgentEngine',
+  OpenSettingsModel: 'openSettingsModel',
+  OpenSettingsIm: 'openSettingsIm',
+  OpenSettingsBrowser: 'openSettingsBrowser',
+  OpenSettingsEmail: 'openSettingsEmail',
+  OpenSettingsMemory: 'openSettingsMemory',
+  OpenSettingsDreaming: 'openSettingsDreaming',
+  OpenSettingsPlugins: 'openSettingsPlugins',
+  OpenSettingsShortcuts: 'openSettingsShortcuts',
+  OpenSettingsAbout: 'openSettingsAbout',
+} as const;
+
+export type ShortcutAction = typeof ShortcutAction[keyof typeof ShortcutAction];
+
+export type ShortcutConfig = Record<ShortcutAction, string> & {
+  [key: string]: string | undefined;
+};
+
 // 配置类型定义
 export interface AppConfig {
   // API 配置
@@ -23,6 +70,7 @@ export interface AppConfig {
     defaultModelProvider?: string;
   };
   providers?: Record<string, ProviderConfig>;
+  providerModelMigrationVersions?: Record<string, number>;
   // 主题配置
   theme: 'light' | 'dark' | 'system';
   // 语言配置
@@ -42,13 +90,7 @@ export interface AppConfig {
     testMode?: boolean;
   };
   // 快捷键配置
-  shortcuts?: {
-    newChat: string;
-    search: string;
-    settings: string;
-    sendMessage: string;
-    [key: string]: string | undefined;
-  };
+  shortcuts?: ShortcutConfig;
 }
 
 const buildDefaultProviders = (): AppConfig['providers'] => {
@@ -94,10 +136,44 @@ export const defaultConfig: AppConfig = {
     testMode: process.env.NODE_ENV === 'development',
   },
   shortcuts: {
-    newChat: 'Ctrl+N',
-    search: 'Ctrl+F',
-    settings: 'Ctrl+,',
-    sendMessage: 'Enter',
+    [ShortcutAction.NewChat]: 'CommandOrControl+N',
+    [ShortcutAction.Search]: 'CommandOrControl+F',
+    [ShortcutAction.Settings]: 'CommandOrControl+,',
+    [ShortcutAction.SendMessage]: 'Enter',
+    [ShortcutAction.ShowShortcuts]: 'CommandOrControl+/',
+    [ShortcutAction.FocusPrompt]: 'CommandOrControl+K',
+    [ShortcutAction.StopCurrentTask]: 'CommandOrControl+.',
+    [ShortcutAction.ToggleSidebar]: 'CommandOrControl+B',
+    [ShortcutAction.ToggleArtifacts]: 'CommandOrControl+Shift+B',
+    [ShortcutAction.PreviousAgent]: '',
+    [ShortcutAction.NextAgent]: '',
+    [ShortcutAction.ShowCurrentAgentTasks]: '',
+    [ShortcutAction.OpenAgentTask1]: '',
+    [ShortcutAction.OpenAgentTask2]: '',
+    [ShortcutAction.OpenAgentTask3]: '',
+    [ShortcutAction.OpenAgentTask4]: '',
+    [ShortcutAction.OpenAgentTask5]: '',
+    [ShortcutAction.OpenAgentTask6]: '',
+    [ShortcutAction.OpenAgentTask7]: '',
+    [ShortcutAction.OpenAgentTask8]: '',
+    [ShortcutAction.OpenAgentTask9]: '',
+    [ShortcutAction.OpenCowork]: 'CommandOrControl+1',
+    [ShortcutAction.OpenScheduledTasks]: 'CommandOrControl+2',
+    [ShortcutAction.OpenKits]: 'CommandOrControl+3',
+    [ShortcutAction.OpenSkills]: 'CommandOrControl+4',
+    [ShortcutAction.OpenMcp]: 'CommandOrControl+5',
+    [ShortcutAction.OpenSettingsGeneral]: '',
+    [ShortcutAction.OpenSettingsAppearance]: '',
+    [ShortcutAction.OpenSettingsAgentEngine]: '',
+    [ShortcutAction.OpenSettingsModel]: '',
+    [ShortcutAction.OpenSettingsIm]: '',
+    [ShortcutAction.OpenSettingsBrowser]: '',
+    [ShortcutAction.OpenSettingsEmail]: '',
+    [ShortcutAction.OpenSettingsMemory]: '',
+    [ShortcutAction.OpenSettingsDreaming]: '',
+    [ShortcutAction.OpenSettingsPlugins]: '',
+    [ShortcutAction.OpenSettingsShortcuts]: '',
+    [ShortcutAction.OpenSettingsAbout]: '',
   }
 };
 

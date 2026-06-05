@@ -296,9 +296,14 @@ const OpenDropdown: React.FC<OpenDropdownProps> = ({ anchorRef, filePath, onClos
 interface ArtifactPreviewCardProps {
   artifact: Artifact;
   onOpenLocalService?: (artifact: Artifact) => void;
+  onOpenHtmlFile?: (artifact: Artifact) => void;
 }
 
-const ArtifactPreviewCard: React.FC<ArtifactPreviewCardProps> = ({ artifact, onOpenLocalService }) => {
+const ArtifactPreviewCard: React.FC<ArtifactPreviewCardProps> = ({
+  artifact,
+  onOpenLocalService,
+  onOpenHtmlFile,
+}) => {
   const dispatch = useDispatch();
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const dropdownAnchorRef = useRef<HTMLButtonElement>(null);
@@ -306,6 +311,10 @@ const ArtifactPreviewCard: React.FC<ArtifactPreviewCardProps> = ({ artifact, onO
   const handleClick = () => {
     if (artifact.type === ArtifactTypeValue.LocalService && onOpenLocalService) {
       onOpenLocalService(artifact);
+      return;
+    }
+    if (artifact.type === ArtifactTypeValue.Html && artifact.filePath && onOpenHtmlFile) {
+      onOpenHtmlFile(artifact);
       return;
     }
     dispatch(openArtifactPreviewTab({ sessionId: artifact.sessionId, artifactId: artifact.id }));

@@ -5,6 +5,7 @@ import {
   COWORK_IMAGE_ATTACHMENT_MAX_BYTES,
   COWORK_IMAGE_ATTACHMENT_PREVIEW_FALLBACK_MAX_BYTES,
   estimateBase64DecodedBytes,
+  formatCoworkImageAttachmentLimit,
   validateCoworkImageAttachmentSize,
 } from './imageAttachments';
 
@@ -15,7 +16,11 @@ test('estimateBase64DecodedBytes handles padding and data URL prefixes', () => {
   expect(estimateBase64DecodedBytes('data:image/png;base64,TWFu')).toBe(3);
 });
 
-test('validateCoworkImageAttachmentSize accepts exactly the 30MiB limit', () => {
+test('formatCoworkImageAttachmentLimit uses a locale-neutral MB label', () => {
+  expect(formatCoworkImageAttachmentLimit()).toBe('30MB');
+});
+
+test('validateCoworkImageAttachmentSize accepts exactly the 30MB limit', () => {
   const validation = validateCoworkImageAttachmentSize({
     base64Data: '',
     sizeBytes: COWORK_IMAGE_ATTACHMENT_MAX_BYTES,
@@ -25,7 +30,7 @@ test('validateCoworkImageAttachmentSize accepts exactly the 30MiB limit', () => 
   expect(validation.sizeBytes).toBe(COWORK_IMAGE_ATTACHMENT_MAX_BYTES);
 });
 
-test('validateCoworkImageAttachmentSize rejects payloads over the 30MiB limit', () => {
+test('validateCoworkImageAttachmentSize rejects payloads over the 30MB limit', () => {
   const validation = validateCoworkImageAttachmentSize({
     base64Data: '',
     sizeBytes: COWORK_IMAGE_ATTACHMENT_MAX_BYTES + 1,

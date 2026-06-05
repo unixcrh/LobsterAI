@@ -53,13 +53,47 @@ import type {
   CoworkStartOptions,
   CoworkUserMemoryEntry,
   OpenClawEngineStatus,
+  OpenClawGatewayRepairResult,
   OpenClawSessionPolicyConfig,
 } from '../types/cowork';
 import { i18nService } from './i18n';
 
+const STREAM_ERROR_DUPLICATE_WINDOW_MS = 10_000;
+
 const classifyError = (error: string): string => {
   const key = classifyErrorKey(error);
   return key ? i18nService.t(key) : error;
+};
+
+const normalizeErrorText = (text: string): string => text.trim();
+
+const hasRecentMatchingErrorMessage = (
+  session: CoworkSession | null | undefined,
+  rawError: string,
+  displayError: string,
+): boolean => {
+  if (!session) return false;
+
+  const expectedTexts = new Set(
+    [rawError, displayError]
+      .map(normalizeErrorText)
+      .filter(Boolean),
+  );
+  if (expectedTexts.size === 0) return false;
+
+  const duplicateAfter = Date.now() - STREAM_ERROR_DUPLICATE_WINDOW_MS;
+  return session.messages.some((message) => {
+    if (message.type !== 'system' || message.timestamp < duplicateAfter) {
+      return false;
+    }
+
+    const messageTexts = [
+      message.content,
+      typeof message.metadata?.error === 'string' ? message.metadata.error : '',
+    ].map(normalizeErrorText);
+
+    return messageTexts.some((text) => expectedTexts.has(text));
+  });
 };
 
 const CONTEXT_USAGE_REFRESH_DELAY_MS = 800;
@@ -254,12 +288,18 @@ class CoworkService {
       store.dispatch(updateSessionStatus({ sessionId, status: 'error' }));
       // Surface the error as a visible message so the user knows what happened.
       if (error) {
+        const displayError = classifyError(error);
+        const currentSession = store.getState().cowork.currentSession;
+        const session = currentSession?.id === sessionId ? currentSession : null;
+        if (hasRecentMatchingErrorMessage(session, error, displayError)) {
+          return;
+        }
         store.dispatch(addMessage({
           sessionId,
           message: {
             id: `error-${Date.now()}`,
             type: 'system',
-            content: classifyError(error),
+            content: displayError,
             timestamp: Date.now(),
           },
         }));
@@ -1200,6 +1240,24 @@ class CoworkService {
       return result.status;
     }
     return this.openClawStatus;
+  }
+
+  async repairOpenClawGatewayState(): Promise<OpenClawGatewayRepairResult> {
+    const engineApi = window.electron?.openclaw?.engine;
+    if (!engineApi?.repairGatewayState) {
+      return {
+        success: false,
+        error: i18nService.t('openClawRepairApiUnavailable'),
+      };
+    }
+    const result = await engineApi.repairGatewayState();
+    if (result?.status) {
+      this.notifyOpenClawStatus(result.status);
+    }
+    return result ?? {
+      success: false,
+      error: i18nService.t('openClawRepairFailed'),
+    };
   }
 
   async generateSessionTitle(prompt: string | null): Promise<string | null> {

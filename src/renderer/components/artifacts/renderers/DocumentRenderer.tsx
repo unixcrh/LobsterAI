@@ -1,9 +1,14 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { i18nService } from '@/services/i18n';
 import type { Artifact } from '@/types/artifact';
 import { openLocalPathWithToast } from '@/utils/localFileActions';
 
+import {
+  type OfficePreviewZoomControlsConfig,
+  useRegisterOfficePreviewZoomControls,
+} from './OfficePreviewActionsContext';
+import { useOfficePreviewZoom } from './OfficeZoomControls';
 import { SheetRenderer } from './sheet/SheetRenderer';
 
 const t = (key: string) => i18nService.t(key);
@@ -92,6 +97,19 @@ const DocxSubRenderer: React.FC<{ artifact: Artifact }> = ({ artifact }) => {
   const wrapperRef = useRef<HTMLDivElement>(null);
   const [error, setError] = useState<string | null>(null);
   const [rendered, setRendered] = useState(false);
+  const [pageCount, setPageCount] = useState(0);
+  const { zoomFactor, zoomIn, zoomOut, resetZoom, handleWheelZoom } = useOfficePreviewZoom();
+  const zoomControls = useMemo<OfficePreviewZoomControlsConfig | null>(() => {
+    if (!rendered || pageCount <= 0) return null;
+    return {
+      zoomFactor,
+      onZoomOut: zoomOut,
+      onZoomIn: zoomIn,
+      onResetZoom: resetZoom,
+    };
+  }, [pageCount, rendered, resetZoom, zoomFactor, zoomIn, zoomOut]);
+
+  useRegisterOfficePreviewZoomControls(zoomControls);
 
   useEffect(() => {
     if (loadError) { setError(loadError); return; }
@@ -104,11 +122,15 @@ const DocxSubRenderer: React.FC<{ artifact: Artifact }> = ({ artifact }) => {
         const { renderAsync } = await import('docx-preview');
         if (cancelled || !containerRef.current) return;
 
+        setError(null);
+        setRendered(false);
+        setPageCount(0);
         containerRef.current.innerHTML = '';
         await renderAsync(data, containerRef.current, undefined, {
           className: 'docx-preview',
           inWrapper: true,
           breakPages: true,
+          ignoreLastRenderedPageBreak: false,
           ignoreWidth: false,
           ignoreHeight: false,
           renderHeaders: true,
@@ -117,7 +139,11 @@ const DocxSubRenderer: React.FC<{ artifact: Artifact }> = ({ artifact }) => {
           renderEndnotes: true,
         });
 
-        if (!cancelled) setRendered(true);
+        const renderedPageCount = supplementDocxPageNumbers(containerRef.current);
+        if (!cancelled) {
+          setPageCount(renderedPageCount);
+          setRendered(true);
+        }
       } catch (e) {
         if (!cancelled) setError(e instanceof Error ? e.message : String(e));
       }
@@ -134,15 +160,9 @@ const DocxSubRenderer: React.FC<{ artifact: Artifact }> = ({ artifact }) => {
 
     const updateZoom = () => {
       const containerWidth = wrapper.clientWidth - 48; // account for document gutter
-      if (containerWidth < DOCX_BASE_WIDTH) {
-        const scale = containerWidth / DOCX_BASE_WIDTH;
-        if (containerRef.current) {
-          containerRef.current.style.zoom = String(scale);
-        }
-      } else {
-        if (containerRef.current) {
-          containerRef.current.style.zoom = '1';
-        }
+      const fitScale = containerWidth < DOCX_BASE_WIDTH ? containerWidth / DOCX_BASE_WIDTH : 1;
+      if (containerRef.current) {
+        containerRef.current.style.zoom = String(fitScale * zoomFactor);
       }
     };
 
@@ -151,7 +171,7 @@ const DocxSubRenderer: React.FC<{ artifact: Artifact }> = ({ artifact }) => {
     updateZoom();
 
     return () => ro.disconnect();
-  }, [rendered]);
+  }, [rendered, zoomFactor]);
 
   if (error) {
     return (
@@ -170,8 +190,15 @@ const DocxSubRenderer: React.FC<{ artifact: Artifact }> = ({ artifact }) => {
   }
 
   return (
-    <div ref={wrapperRef} className="h-full overflow-auto bg-[#f5f5f5]">
-      <div ref={containerRef} className="docx-container" />
+    <div className="h-full flex flex-col overflow-hidden bg-[#f5f5f5]">
+      {rendered && pageCount > 0 && (
+        <div className="shrink-0 border-b border-[#e0e0e0] px-3 py-1.5 text-xs text-[#999]">
+          <span>{pageCount} {t('artifactPdfPageCount')}</span>
+        </div>
+      )}
+      <div ref={wrapperRef} className="flex-1 overflow-auto" onWheel={handleWheelZoom}>
+        <div ref={containerRef} className="docx-container" />
+      </div>
       <style>{`
         .docx-container {
           box-sizing: border-box;
@@ -195,13 +222,53 @@ const DocxSubRenderer: React.FC<{ artifact: Artifact }> = ({ artifact }) => {
           box-shadow: 0 2px 8px rgba(0,0,0,0.12);
           margin: 0 auto 16px !important;
           border-radius: 2px;
-          padding: 60px 50px !important;
           box-sizing: border-box;
         }
       `}</style>
     </div>
   );
 };
+
+function supplementDocxPageNumbers(container: HTMLElement): number {
+  const pages = Array.from(container.querySelectorAll<HTMLElement>('section.docx-preview'));
+  const totalPages = pages.length;
+
+  pages.forEach((page, index) => {
+    const pageNumber = index + 1;
+    const scopes = Array.from(page.querySelectorAll<HTMLElement>('header, footer'));
+
+    scopes.forEach(scope => {
+      const textBlocks = Array.from(scope.querySelectorAll<HTMLElement>('p'));
+      const targets = textBlocks.length > 0 ? textBlocks : [scope];
+
+      targets.forEach(target => {
+        const originalText = target.textContent || '';
+        const supplementedText = supplementDocxPageNumberText(originalText, pageNumber, totalPages);
+        if (supplementedText !== originalText) {
+          target.textContent = supplementedText;
+        }
+      });
+    });
+  });
+
+  return totalPages;
+}
+
+function supplementDocxPageNumberText(text: string, pageNumber: number, totalPages: number): string {
+  let result = text;
+  result = result.replace(/第\s*页/g, `第 ${pageNumber} 页`);
+  result = result.replace(/共\s*页/g, `共 ${totalPages} 页`);
+
+  if (/^\s*Page\s*of\s*$/i.test(result)) {
+    return result.replace(/Page\s*of/i, `Page ${pageNumber} of ${totalPages}`);
+  }
+
+  if (/^\s*Page\s*$/i.test(result)) {
+    return result.replace(/Page/i, `Page ${pageNumber}`);
+  }
+
+  return result;
+}
 
 // --- Pdf Sub-Renderer (pdfjs-dist, lazy page rendering) ---
 
@@ -214,6 +281,18 @@ const PdfSubRenderer: React.FC<{ artifact: Artifact }> = ({ artifact }) => {
   const [pdfDoc, setPdfDoc] = useState<any>(null);
   const [renderWidth, setRenderWidth] = useState(0);
   const containerRef = useRef<HTMLDivElement>(null);
+  const { zoomFactor, zoomIn, zoomOut, resetZoom, handleWheelZoom } = useOfficePreviewZoom();
+  const zoomControls = useMemo<OfficePreviewZoomControlsConfig | null>(() => {
+    if (!pdfDoc || pageCount <= 0) return null;
+    return {
+      zoomFactor,
+      onZoomOut: zoomOut,
+      onZoomIn: zoomIn,
+      onResetZoom: resetZoom,
+    };
+  }, [pageCount, pdfDoc, resetZoom, zoomFactor, zoomIn, zoomOut]);
+
+  useRegisterOfficePreviewZoomControls(zoomControls);
 
   // Measure container width once it's laid out (debounced)
   useEffect(() => {
@@ -282,16 +361,17 @@ const PdfSubRenderer: React.FC<{ artifact: Artifact }> = ({ artifact }) => {
   }
 
   const pages = Array.from({ length: pageCount }, (_, i) => i + 1);
+  const zoomedRenderWidth = Math.max(120, Math.floor(renderWidth * zoomFactor));
 
   return (
     <div className="h-full flex flex-col overflow-hidden bg-[#f5f5f5]">
-      <div className="px-3 py-1.5 text-xs text-[#999] border-b border-[#e0e0e0] shrink-0">
-        {pageCount} {t('artifactPdfPageCount')}
+      <div className="shrink-0 border-b border-[#e0e0e0] px-3 py-1.5 text-xs text-[#999]">
+        <span>{pageCount} {t('artifactPdfPageCount')}</span>
       </div>
-      <div ref={containerRef} className="flex-1 overflow-auto p-6">
+      <div ref={containerRef} className="flex-1 overflow-auto p-6" onWheel={handleWheelZoom}>
         {renderWidth > 0 && pages.map(pageNum => (
           <div key={pageNum} style={{ marginBottom: PDF_PAGE_GAP }}>
-            <PdfPageCanvas pdfDoc={pdfDoc} pageNumber={pageNum} width={renderWidth} />
+            <PdfPageCanvas pdfDoc={pdfDoc} pageNumber={pageNum} width={zoomedRenderWidth} />
           </div>
         ))}
       </div>
@@ -746,9 +826,25 @@ const LegacyPptxSubRenderer: React.FC<{ artifact: Artifact }> = ({ artifact }) =
   const [error, setError] = useState<string | null>(null);
   const [rendered, setRendered] = useState(false);
   const [slideCount, setSlideCount] = useState(0);
+  const [effectiveZoomFactor, setEffectiveZoomFactor] = useState(1);
+  const { zoomFactor, zoomIn, zoomOut, resetZoom, handleWheelZoom, handleNativeWheelZoom } = useOfficePreviewZoom();
+  const zoomControls = useMemo<OfficePreviewZoomControlsConfig | null>(() => {
+    if (slideCount <= 0) return null;
+    return {
+      zoomFactor,
+      displayZoomFactor: effectiveZoomFactor,
+      onZoomOut: zoomOut,
+      onZoomIn: zoomIn,
+      onResetZoom: resetZoom,
+    };
+  }, [effectiveZoomFactor, resetZoom, slideCount, zoomFactor, zoomIn, zoomOut]);
+
+  useRegisterOfficePreviewZoomControls(zoomControls);
 
   const PPTX_RENDER_WIDTH = 600;
   const PPTX_THUMBNAIL_WIDTH = 150;
+  const PPTX_AUTO_FIT_USAGE = 0.86;
+  const PPTX_MAX_AUTO_FIT_SCALE = 1.7;
 
   useEffect(() => {
     if (loadError) { setError(loadError); return; }
@@ -772,6 +868,7 @@ const LegacyPptxSubRenderer: React.FC<{ artifact: Artifact }> = ({ artifact }) =
         mainPreviewerRef.current = null;
         thumbnailPreviewerRef.current = null;
         setRendered(false);
+        setEffectiveZoomFactor(1);
 
         iframeDoc.open();
         iframeDoc.write(`<!DOCTYPE html><html><head><style>
@@ -780,8 +877,21 @@ const LegacyPptxSubRenderer: React.FC<{ artifact: Artifact }> = ({ artifact }) =
           body { padding: 16px; overflow-y: auto; }
           #pptx-layout { width: 100%; min-height: 100px; }
           #pptx-thumbnails { display: none; }
-          #pptx-main { width: 100%; min-width: 0; }
+          #pptx-main {
+            width: 100%;
+            min-width: 0;
+            overflow: auto;
+            --pptx-main-scale: 1;
+            --pptx-main-width: 600px;
+            --pptx-main-padding-y: 0px;
+          }
           .pptx-preview-wrapper { background: transparent !important; width: 100% !important; max-width: 100% !important; height: auto !important; overflow: visible !important; }
+          #pptx-main .pptx-preview-wrapper {
+            width: var(--pptx-main-width) !important;
+            max-width: none !important;
+            margin: 0 auto !important;
+            zoom: var(--pptx-main-scale);
+          }
           .pptx-preview-wrapper > div { margin-bottom: 16px; box-shadow: 0 2px 8px rgba(0,0,0,0.12); border-radius: 4px; overflow: hidden; }
           .pptx-preview-wrapper > div:last-child { margin-bottom: 0; }
           canvas { width: 100% !important; height: auto !important; display: block; }
@@ -804,14 +914,14 @@ const LegacyPptxSubRenderer: React.FC<{ artifact: Artifact }> = ({ artifact }) =
             #pptx-main {
               min-height: 0;
               overflow: auto;
-              display: flex;
-              align-items: center;
-              justify-content: center;
-              padding: 12px;
+              display: block;
+              padding: var(--pptx-main-padding-y) 12px;
             }
             #pptx-main .pptx-preview-wrapper {
-              max-width: 600px !important;
+              width: var(--pptx-main-width) !important;
+              max-width: none !important;
               margin: 0 auto !important;
+              zoom: var(--pptx-main-scale);
             }
             #pptx-main .pptx-preview-wrapper > div {
               display: none;
@@ -931,19 +1041,44 @@ const LegacyPptxSubRenderer: React.FC<{ artifact: Artifact }> = ({ artifact }) =
     };
   }, [data, loadError]);
 
-  // Adaptive zoom for PPTX container
+  // Adaptive zoom for the rendered PPTX slides inside the iframe.
   useEffect(() => {
     const container = containerRef.current;
     const iframe = iframeRef.current;
     if (!container || !iframe || !rendered) return;
 
     const updateZoom = () => {
-      const containerWidth = container.clientWidth;
-      if (containerWidth < PPTX_RENDER_WIDTH) {
-        iframe.style.zoom = String(containerWidth / PPTX_RENDER_WIDTH);
-      } else {
-        iframe.style.zoom = '1';
-      }
+      const iframeDoc = iframe.contentDocument || iframe.contentWindow?.document;
+      const mainRoot = iframeDoc?.getElementById('pptx-main');
+      if (!mainRoot) return;
+
+      const mainStyle = iframe.contentWindow?.getComputedStyle(mainRoot);
+      const horizontalPadding = (parseFloat(mainStyle?.paddingLeft || '0') || 0) + (parseFloat(mainStyle?.paddingRight || '0') || 0);
+      const isDesktopLayout = Boolean(iframe.contentWindow?.matchMedia('(min-width: 760px)').matches);
+      const minVerticalPadding = isDesktopLayout ? 12 : 0;
+      const availableWidth = Math.max(160, mainRoot.clientWidth - horizontalPadding);
+      const activeSlide = mainRoot.querySelector<HTMLElement>('.pptx-preview-wrapper > div.is-active-slide')
+        || mainRoot.querySelector<HTMLElement>('.pptx-preview-wrapper > div');
+      const previousSlideScale = parseFloat(mainStyle?.getPropertyValue('--pptx-main-scale') || '1') || 1;
+      const baseSlideHeight = parseFloat(activeSlide?.style.height || '')
+        || ((activeSlide?.getBoundingClientRect().height || 0) / previousSlideScale)
+        || Math.round(PPTX_RENDER_WIDTH * 9 / 16);
+      const availableHeight = Math.max(120, mainRoot.clientHeight - minVerticalPadding * 2);
+      const widthFitScale = (availableWidth * PPTX_AUTO_FIT_USAGE) / PPTX_RENDER_WIDTH;
+      const heightFitScale = (availableHeight * PPTX_AUTO_FIT_USAGE) / baseSlideHeight;
+      const autoFitScale = isDesktopLayout
+        ? Math.max(1, Math.min(PPTX_MAX_AUTO_FIT_SCALE, widthFitScale, heightFitScale))
+        : Math.min(1, availableWidth / PPTX_RENDER_WIDTH);
+      const slideScale = Number((autoFitScale * zoomFactor).toFixed(3));
+      mainRoot.style.setProperty('--pptx-main-scale', String(slideScale));
+      mainRoot.style.setProperty('--pptx-main-width', `${PPTX_RENDER_WIDTH}px`);
+      setEffectiveZoomFactor(current => (Math.abs(current - slideScale) > 0.005 ? slideScale : current));
+
+      const scaledSlideHeight = baseSlideHeight * slideScale;
+      const centeredVerticalPadding = scaledSlideHeight > 0
+        ? Math.max(minVerticalPadding, Math.floor((mainRoot.clientHeight - scaledSlideHeight) / 2))
+        : minVerticalPadding;
+      mainRoot.style.setProperty('--pptx-main-padding-y', `${centeredVerticalPadding}px`);
     };
 
     const ro = new ResizeObserver(updateZoom);
@@ -951,7 +1086,20 @@ const LegacyPptxSubRenderer: React.FC<{ artifact: Artifact }> = ({ artifact }) =
     updateZoom();
 
     return () => ro.disconnect();
-  }, [rendered]);
+  }, [rendered, zoomFactor]);
+
+  useEffect(() => {
+    const iframe = iframeRef.current;
+    if (!iframe || !rendered) return;
+
+    const iframeDoc = iframe.contentDocument || iframe.contentWindow?.document;
+    if (!iframeDoc) return;
+
+    iframeDoc.addEventListener('wheel', handleNativeWheelZoom, { passive: false });
+    return () => {
+      iframeDoc.removeEventListener('wheel', handleNativeWheelZoom);
+    };
+  }, [handleNativeWheelZoom, rendered]);
 
   // Fallback: HTML slides or text extraction when pptx-preview fails
   if (error === 'render_failed') {
@@ -969,11 +1117,11 @@ const LegacyPptxSubRenderer: React.FC<{ artifact: Artifact }> = ({ artifact }) =
   return (
     <div className="h-full flex flex-col overflow-hidden">
       {slideCount > 0 && (
-        <div className="px-4 py-1.5 text-xs text-muted border-b border-border shrink-0">
-          {t('artifactSlideCount').replace('{count}', String(slideCount))}
+        <div className="shrink-0 border-b border-border px-4 py-1.5 text-xs text-muted">
+          <span>{t('artifactSlideCount').replace('{count}', String(slideCount))}</span>
         </div>
       )}
-      <div ref={containerRef} className="flex-1 relative min-h-0">
+      <div ref={containerRef} className="flex-1 relative min-h-0" onWheel={handleWheelZoom}>
         {(loading || !rendered) && (
           <div className="absolute inset-0 flex items-center justify-center text-muted text-sm z-10 bg-background">
             {t('artifactDocumentLoading')}

@@ -1,4 +1,4 @@
-export const COWORK_IMAGE_ATTACHMENT_MAX_BYTES = 30 * 1024 * 1024;
+export const COWORK_IMAGE_ATTACHMENT_MAX_BYTES = 30 * 1000 * 1000;
 export const COWORK_IMAGE_ATTACHMENT_PREVIEW_FALLBACK_MAX_BYTES = 512 * 1024;
 
 export type CoworkImageAttachmentPayload = {
@@ -40,7 +40,7 @@ export function estimateBase64DecodedBytes(base64Value: string): number {
 }
 
 export function formatCoworkImageAttachmentLimit(bytes = COWORK_IMAGE_ATTACHMENT_MAX_BYTES): string {
-  return `${Math.floor(bytes / 1024 / 1024)}MiB`;
+  return `${Math.floor(bytes / 1000 / 1000)}MB`;
 }
 
 export function validateCoworkImageAttachmentSize(

@@ -85,9 +85,82 @@ const FORK_COMPACTION_SUMMARY_MAX_CHARS = 40_000;
 const GATEWAY_READY_TIMEOUT_MS = 60_000;
 const FINAL_HISTORY_SYNC_LIMIT = 50;
 const CHANNEL_SESSION_DISCOVERY_LIMIT = 200;
+export const OPENCLAW_CHAT_SEND_PAYLOAD_LIMIT_BYTES = 30 * 1000 * 1000;
+export const OPENCLAW_CHAT_SEND_PAYLOAD_SAFETY_MARGIN_BYTES = 500 * 1000;
+export const OPENCLAW_CHAT_SEND_PAYLOAD_SAFE_LIMIT_BYTES =
+  OPENCLAW_CHAT_SEND_PAYLOAD_LIMIT_BYTES - OPENCLAW_CHAT_SEND_PAYLOAD_SAFETY_MARGIN_BYTES;
+const WebSocketCloseCode = {
+  MessageTooBig: 1009,
+} as const;
 const MediaGenerationToolAction = {
   Status: 'status',
 } as const;
+
+type OpenClawChatSendFrameEstimate = {
+  id: string;
+  method: string;
+  params: unknown;
+};
+
+type ChatSendAttachmentLike = {
+  content?: string;
+};
+
+export function estimateOpenClawChatSendFrameBytes(params: unknown): number {
+  const frame: OpenClawChatSendFrameEstimate = {
+    id: 'estimate',
+    method: 'chat.send',
+    params,
+  };
+  return Buffer.byteLength(JSON.stringify(frame), 'utf8');
+}
+
+function sumAttachmentBase64Bytes(attachments?: ChatSendAttachmentLike[]): number {
+  return (attachments ?? []).reduce((total, attachment) => {
+    return total + (typeof attachment.content === 'string' ? attachment.content.length : 0);
+  }, 0);
+}
+
+export function buildOpenClawChatSendPayloadTooLargeError(options: {
+  estimatedFrameBytes: number;
+  safeLimitBytes: number;
+  attachmentCount: number;
+  attachmentBase64Bytes: number;
+}): Error {
+  return new Error(
+    `chat.send payload too large: estimated ${options.estimatedFrameBytes} bytes exceeds safe limit `
+    + `${options.safeLimitBytes} bytes; attachments ${options.attachmentCount}; attachment base64 bytes `
+    + `${options.attachmentBase64Bytes}`,
+  );
+}
+
+function assertOpenClawChatSendPayloadWithinLimit(
+  sessionId: string,
+  params: unknown,
+  attachments?: ChatSendAttachmentLike[],
+): void {
+  const estimatedFrameBytes = estimateOpenClawChatSendFrameBytes(params);
+  if (estimatedFrameBytes <= OPENCLAW_CHAT_SEND_PAYLOAD_SAFE_LIMIT_BYTES) {
+    return;
+  }
+
+  const attachmentCount = attachments?.length ?? 0;
+  const attachmentBase64Bytes = sumAttachmentBase64Bytes(attachments);
+  console.warn(
+    '[OpenClawRuntime] chat.send payload exceeded safe limit.',
+    `Session ${sessionId}.`,
+    `Estimated ${estimatedFrameBytes} bytes.`,
+    `Safe limit ${OPENCLAW_CHAT_SEND_PAYLOAD_SAFE_LIMIT_BYTES} bytes.`,
+    `Attachments ${attachmentCount}.`,
+    `Attachment base64 total ${attachmentBase64Bytes} bytes.`,
+  );
+  throw buildOpenClawChatSendPayloadTooLargeError({
+    estimatedFrameBytes,
+    safeLimitBytes: OPENCLAW_CHAT_SEND_PAYLOAD_SAFE_LIMIT_BYTES,
+    attachmentCount,
+    attachmentBase64Bytes,
+  });
+}
 
 function validateRuntimeImageAttachments(
   imageAttachments?: CoworkImageAttachment[],
@@ -1405,6 +1478,7 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
   private static readonly VISIBLE_FINAL_LARGE_TOOL_CONFIRMATION_GRACE_MS = 8_000;
   private static readonly VISIBLE_FINAL_TOOL_RESULT_CHAR_THRESHOLD = 20_000;
   private static readonly VISIBLE_FINAL_SHORT_TEXT_CHAR_THRESHOLD = 600;
+  private static readonly GATEWAY_SESSION_DELETE_TIMEOUT_MS = 5_000;
 
   private gatewayClient: GatewayClientLike | null = null;
   private gatewayClientVersion: string | null = null;
@@ -3146,16 +3220,22 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
       if (attachments) {
         console.log('[OpenClawRuntime] chat.send with attachments:', attachments.length, 'images,', attachments.map(a => ({ type: a.type, mimeType: a.mimeType, contentLength: a.content?.length ?? 0 })));
       }
-      const chatSendStartMs = Date.now();
-      firstResponseTiming.chatSendStartedAtMs = chatSendStartMs;
-      const sendResult = await client.request<Record<string, unknown>>('chat.send', {
+      const chatSendParams = {
         sessionKey,
         message: outboundMessage,
         deliver: false,
         idempotencyKey: runId,
         ...(runCwd ? { cwd: runCwd } : {}),
         ...(attachments ? { attachments } : {}),
-      }, { timeoutMs: 90_000 });
+      };
+      assertOpenClawChatSendPayloadWithinLimit(sessionId, chatSendParams, attachments);
+      const chatSendStartMs = Date.now();
+      firstResponseTiming.chatSendStartedAtMs = chatSendStartMs;
+      const sendResult = await client.request<Record<string, unknown>>(
+        'chat.send',
+        chatSendParams,
+        { timeoutMs: 90_000 },
+      );
       const chatSendElapsedMs = Date.now() - chatSendStartMs;
       firstResponseTiming.chatSendAckAtMs = Date.now();
       console.log(
@@ -3506,7 +3586,10 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
         }
 
         console.warn('[OpenClawRuntime] gateway WS disconnected — code:', _code, 'reason:', reason);
-        const disconnectedError = new Error(reason || 'OpenClaw gateway client disconnected');
+        const disconnectedMessage = _code === WebSocketCloseCode.MessageTooBig
+          ? (reason || 'gateway closed (1009):')
+          : (reason || 'OpenClaw gateway client disconnected');
+        const disconnectedError = new Error(disconnectedMessage);
         const activeSessionIds = Array.from(this.activeTurns.keys());
         activeSessionIds.forEach((sessionId) => {
           this.store.updateSession(sessionId, { status: 'error' });
@@ -6738,6 +6821,34 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
     }
   }
 
+  private async syncLatestChannelUserMessage(sessionId: string, sessionKey: string): Promise<void> {
+    const client = this.gatewayClient;
+    if (!client) {
+      console.log('[ChannelSync] no gateway client, skipping latest channel user sync');
+      return;
+    }
+
+    const history = await client.request<{ messages?: unknown[] }>('chat.history', {
+      sessionKey,
+      limit: FINAL_HISTORY_SYNC_LIMIT,
+    }, { timeoutMs: 10_000 });
+    if (!Array.isArray(history?.messages) || history.messages.length === 0) {
+      this.channelSyncCursor.set(sessionId, 0);
+      return;
+    }
+
+    this.markGatewayHistoryWindowConsumed(sessionId, history.messages);
+    this.syncChannelUserMessages(
+      sessionId,
+      history.messages,
+      true,
+      sessionKey.includes(':discord:'),
+      sessionKey.includes(':qqbot:'),
+      sessionKey.includes(':moltbot-popo:'),
+      sessionKey.includes(':feishu:'),
+    );
+  }
+
   private async syncFinalAssistantWithHistory(sessionId: string, turn: ActiveTurn): Promise<void> {
     console.debug('[OpenClawRuntime] syncFinalAssistant — sessionId:', sessionId);
     const client = this.gatewayClient;
@@ -7231,6 +7342,11 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
    * Delegates to reconcileWithHistory which handles diff and update.
    */
   private async incrementalChannelSync(sessionId: string, sessionKey: string): Promise<void> {
+    if (this.reCreatedChannelSessionIds.has(sessionId)) {
+      await this.syncLatestChannelUserMessage(sessionId, sessionKey);
+      return;
+    }
+
     await this.reconcileWithHistory(sessionId, sessionKey);
   }
 
@@ -7379,10 +7495,18 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
       }
     }
 
+    const removedChannelKeys = removedKeys.filter((key) =>
+      this.channelSessionSync?.isChannelSessionKey(key) ?? false,
+    );
+
     // Suppress polling re-creation for deleted channel keys.
     // Only real-time events (new IM messages) will re-create the session.
-    for (const key of removedKeys) {
+    for (const key of removedChannelKeys) {
       this.deletedChannelKeys.add(key);
+    }
+
+    if (removedKeys.length > 0) {
+      void this.deleteGatewaySessionTranscripts(removedKeys);
     }
 
     // Allow polling to rediscover channel sessions
@@ -7415,6 +7539,27 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
 
     // Clean up subagent tracking state and persisted messages
     this.subagentTracker.onSessionDeleted(sessionId);
+  }
+
+  private async deleteGatewaySessionTranscripts(sessionKeys: string[]): Promise<void> {
+    const client = this.gatewayClient;
+    if (!client) {
+      console.warn('[OpenClawRuntime] could not delete gateway session transcripts because the gateway client is unavailable');
+      return;
+    }
+
+    const uniqueKeys = Array.from(new Set(sessionKeys.filter(Boolean)));
+    for (const sessionKey of uniqueKeys) {
+      try {
+        await client.request('sessions.delete', {
+          key: sessionKey,
+          deleteTranscript: true,
+        }, { timeoutMs: OpenClawRuntimeAdapter.GATEWAY_SESSION_DELETE_TIMEOUT_MS });
+        console.log(`[OpenClawRuntime] deleted gateway session transcript for ${sessionKey}`);
+      } catch (error) {
+        console.warn(`[OpenClawRuntime] failed to delete gateway session transcript for ${sessionKey}:`, error);
+      }
+    }
   }
 
   /**
@@ -7537,7 +7682,11 @@ export class OpenClawRuntimeAdapter extends EventEmitter implements CoworkRuntim
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
       try {
         const beforeCount = this.getUserMessageCount(sessionId);
-        await this.reconcileWithHistory(sessionId, sessionKey);
+        if (this.reCreatedChannelSessionIds.has(sessionId)) {
+          await this.syncLatestChannelUserMessage(sessionId, sessionKey);
+        } else {
+          await this.reconcileWithHistory(sessionId, sessionKey);
+        }
         const afterCount = this.getUserMessageCount(sessionId);
         const newUserMessages = afterCount - beforeCount;
         console.log('[Debug:prefetch] reconciled (attempt', attempt, ') synced user messages:', newUserMessages, '(before:', beforeCount, 'after:', afterCount, ')');

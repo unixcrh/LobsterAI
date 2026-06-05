@@ -12,6 +12,7 @@ import { createPortal } from 'react-dom';
 import { useDispatch, useSelector } from 'react-redux';
 
 import { authService } from '@/services/auth';
+import { copyTextToClipboard } from '@/services/clipboard';
 import { getPortalPricingUrl, PortalPricingKeyfrom } from '@/services/endpoints';
 import { i18nService } from '@/services/i18n';
 import type { RootState } from '@/store';
@@ -40,6 +41,11 @@ import CopyIcon from '../icons/CopyIcon';
 import ArtifactRenderer from './ArtifactRenderer';
 import FileDirectoryView from './FileDirectoryView';
 import CodeRenderer from './renderers/CodeRenderer';
+import {
+  OfficePreviewActionsContext,
+  type OfficePreviewZoomControlsConfig,
+} from './renderers/OfficePreviewActionsContext';
+import { OfficeZoomControls } from './renderers/OfficeZoomControls';
 
 const t = (key: string) => i18nService.t(key);
 
@@ -251,12 +257,15 @@ interface ArtifactPanelProps {
   activeSpecialTab?: ArtifactSpecialTab;
   minPanelWidth?: number;
   maxPanelWidth?: number;
+  isPanelExpanded?: boolean;
   browserAddress?: string;
   browserUrl?: string;
+  browserHtmlArtifactId?: string | null;
   onBrowserAddressChange?: (value: string) => void;
   onBrowserUrlChange?: (value: string) => void;
   onOpenFileListTab?: () => void;
   onOpenBrowserTab?: () => void;
+  onOpenHtmlFileInBrowser?: (artifact: Artifact) => void;
   onBrowserAnnotationCaptured?: (payload: BrowserAnnotationPayload) => void;
   onAddSelectedText?: (snippet: CoworkSelectedTextSnippet) => void;
   selectedTextEnabled?: boolean;
@@ -319,12 +328,15 @@ const ArtifactPanel: React.FC<ArtifactPanelProps> = ({
   activeSpecialTab = ArtifactSpecialTab.FileList,
   minPanelWidth = MIN_PANEL_WIDTH,
   maxPanelWidth = MAX_PANEL_WIDTH,
+  isPanelExpanded = false,
   browserAddress: controlledBrowserAddress,
   browserUrl: controlledBrowserUrl,
+  browserHtmlArtifactId,
   onBrowserAddressChange,
   onBrowserUrlChange,
   onOpenFileListTab,
   onOpenBrowserTab,
+  onOpenHtmlFileInBrowser,
   onBrowserAnnotationCaptured,
   onAddSelectedText,
   selectedTextEnabled = false,
@@ -348,6 +360,8 @@ const ArtifactPanel: React.FC<ArtifactPanelProps> = ({
   const [htmlShareCopyStatus, setHtmlShareCopyStatus] =
     useState<HtmlShareCopyStatus>(HtmlShareCopyStatus.Idle);
   const [isArtifactActionsMenuOpen, setIsArtifactActionsMenuOpen] = useState(false);
+  const [officePreviewZoomControls, setOfficePreviewZoomControls] =
+    useState<OfficePreviewZoomControlsConfig | null>(null);
   const fileListDrawerRef = useRef<HTMLDivElement>(null);
   const fileListButtonRef = useRef<HTMLButtonElement>(null);
   const artifactActionsMenuRef = useRef<HTMLDivElement>(null);
@@ -364,15 +378,31 @@ const ArtifactPanel: React.FC<ArtifactPanelProps> = ({
   const selectedArtifact = activePreviewTab
     ? (artifactsById.get(activePreviewTab.artifactId) ?? null)
     : null;
-  const selectedHtmlFilePath =
-    selectedArtifact?.type === ArtifactTypeValue.Html ? selectedArtifact.filePath : undefined;
+  const browserHtmlArtifact = browserHtmlArtifactId
+    ? (artifactsById.get(browserHtmlArtifactId) ?? null)
+    : null;
+  const isBrowserTabActive = !selectedArtifact && activeSpecialTab === ArtifactSpecialTab.Browser;
+  const htmlShareArtifact =
+    selectedArtifact?.type === ArtifactTypeValue.Html
+      ? selectedArtifact
+      : isBrowserTabActive && browserHtmlArtifact?.type === ArtifactTypeValue.Html
+        ? browserHtmlArtifact
+        : null;
+  const selectedHtmlFilePath = htmlShareArtifact?.filePath;
   const selectedHtmlShare =
     selectedHtmlFilePath && htmlShareLookup?.filePath === selectedHtmlFilePath
       ? htmlShareLookup.share
       : undefined;
   const selectedArtifactId = selectedArtifact?.id ?? null;
   const activeTab = activePreviewTab?.contentView ?? ArtifactContentView.Preview;
-  const isDocumentArtifact = selectedArtifact?.type === 'document';
+  const canShowCodeView = Boolean(selectedArtifact && !NON_CODE_TYPES.has(selectedArtifact.type));
+  const isCodeViewActive = canShowCodeView && activeTab === ArtifactContentView.Code;
+  const contentViewActionTarget = isCodeViewActive
+    ? ArtifactContentView.Preview
+    : ArtifactContentView.Code;
+  const contentViewActionLabel = isCodeViewActive
+    ? t('artifactPreview')
+    : t('artifactCode');
   const selectedTextContext = useMemo(
     () => (
       selectedTextEnabled && onAddSelectedText
@@ -387,10 +417,12 @@ const ArtifactPanel: React.FC<ArtifactPanelProps> = ({
   const startWidth = useRef(0);
   const previousBodyCursor = useRef('');
   const [panelIsResizing, setPanelIsResizing] = useState(false);
-  const constrainedMaxPanelWidth = Math.max(
-    MIN_PANEL_WIDTH,
-    Math.min(MAX_PANEL_WIDTH, maxPanelWidth),
-  );
+  const constrainedMaxPanelWidth = isPanelExpanded
+    ? Math.max(MIN_PANEL_WIDTH, maxPanelWidth)
+    : Math.max(
+        MIN_PANEL_WIDTH,
+        Math.min(MAX_PANEL_WIDTH, maxPanelWidth),
+      );
   const constrainedMinPanelWidth = Math.min(
     constrainedMaxPanelWidth,
     Math.max(MIN_PANEL_WIDTH, minPanelWidth),
@@ -417,9 +449,14 @@ const ArtifactPanel: React.FC<ArtifactPanelProps> = ({
     ? 'p-1 rounded bg-primary/10 text-primary transition-colors hover:bg-primary/20 disabled:cursor-not-allowed disabled:opacity-50'
     : 'p-1 rounded text-secondary transition-colors hover:bg-surface hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50';
   const canShareHtmlArtifact = Boolean(
-    selectedArtifact?.type === ArtifactTypeValue.Html &&
+    htmlShareArtifact?.type === ArtifactTypeValue.Html &&
       selectedHtmlFilePath,
   );
+  const browserHtmlAutoRefreshFilePath =
+    isBrowserTabActive && browserHtmlArtifact?.type === ArtifactTypeValue.Html
+      ? browserHtmlArtifact.filePath
+      : undefined;
+  const browserHtmlPreviewUrl = browserHtmlAutoRefreshFilePath ? browserUrl : undefined;
   const canUseHtmlShareDialogLink = Boolean(
     htmlShareDialog?.url &&
       !isHtmlShareStatusUpdating &&
@@ -455,13 +492,25 @@ const ArtifactPanel: React.FC<ArtifactPanelProps> = ({
   const showRevealInFolderActionInMenu = Boolean(
     showRevealInFolderAction && !showPrimaryRevealInFolderAction,
   );
+  const showContentViewActionInMenu = canShowCodeView;
+  const showOfficeZoomControlsInMenu = Boolean(officePreviewZoomControls);
+  const hasArtifactActionMenuItems = Boolean(
+    showContentViewActionInMenu ||
+      showRefreshAction ||
+      showCopyAction ||
+      showOpenBrowserActionInMenu ||
+      showOpenWithAppActionInMenu ||
+      showRevealInFolderActionInMenu,
+  );
   const showArtifactActionsMenu = Boolean(
     isCompactArtifactToolbar &&
-      (showRefreshAction ||
-        showCopyAction ||
-        showOpenBrowserActionInMenu ||
-        showOpenWithAppActionInMenu ||
-        showRevealInFolderActionInMenu),
+      (hasArtifactActionMenuItems || showOfficeZoomControlsInMenu),
+  );
+  const officePreviewActionsContextValue = useMemo(
+    () => ({
+      setZoomControls: setOfficePreviewZoomControls,
+    }),
+    [],
   );
 
   const handleBrowserAddressChange = useCallback(
@@ -523,6 +572,7 @@ const ArtifactPanel: React.FC<ArtifactPanelProps> = ({
 
   const handleResizeStart = useCallback(
     (e: React.PointerEvent<HTMLDivElement>) => {
+      if (isPanelExpanded) return;
       e.preventDefault();
       e.currentTarget.setPointerCapture(e.pointerId);
       isResizing.current = true;
@@ -572,6 +622,7 @@ const ArtifactPanel: React.FC<ArtifactPanelProps> = ({
       constrainedMinPanelWidth,
       constrainedPanelWidth,
       dispatch,
+      isPanelExpanded,
       sessionId,
     ],
   );
@@ -769,10 +820,21 @@ const ArtifactPanel: React.FC<ArtifactPanelProps> = ({
     (id: string) => {
       const artifact = artifacts.find(item => item.id === id);
       if (artifact && openLocalServiceArtifact(artifact)) return;
+      if (artifact?.type === ArtifactTypeValue.Html && artifact.filePath && onOpenHtmlFileInBrowser) {
+        onOpenHtmlFileInBrowser(artifact);
+        return;
+      }
       onOpenFileListTab?.();
       dispatch(openArtifactPreviewTab({ sessionId, artifactId: id }));
     },
-    [artifacts, dispatch, onOpenFileListTab, openLocalServiceArtifact, sessionId],
+    [
+      artifacts,
+      dispatch,
+      onOpenFileListTab,
+      onOpenHtmlFileInBrowser,
+      openLocalServiceArtifact,
+      sessionId,
+    ],
   );
 
   const handleSelectArtifactFromDrawer = useCallback(
@@ -782,10 +844,22 @@ const ArtifactPanel: React.FC<ArtifactPanelProps> = ({
         closeFileListDrawer();
         return;
       }
+      if (artifact?.type === ArtifactTypeValue.Html && artifact.filePath && onOpenHtmlFileInBrowser) {
+        onOpenHtmlFileInBrowser(artifact);
+        closeFileListDrawer();
+        return;
+      }
       dispatch(openArtifactPreviewTab({ sessionId, artifactId: id }));
       closeFileListDrawer();
     },
-    [artifacts, closeFileListDrawer, dispatch, openLocalServiceArtifact, sessionId],
+    [
+      artifacts,
+      closeFileListDrawer,
+      dispatch,
+      onOpenHtmlFileInBrowser,
+      openLocalServiceArtifact,
+      sessionId,
+    ],
   );
 
   const handleSetContentView = useCallback(
@@ -842,6 +916,15 @@ const ArtifactPanel: React.FC<ArtifactPanelProps> = ({
   const handleOpenInBrowser = useCallback(() => {
     if (!selectedArtifact) return;
 
+    if (
+      selectedArtifact.type === ArtifactTypeValue.Html &&
+      selectedArtifact.filePath &&
+      onOpenHtmlFileInBrowser
+    ) {
+      onOpenHtmlFileInBrowser(selectedArtifact);
+      return;
+    }
+
     // Mermaid needs HTML wrapper with mermaid.js to render in browser
     if (selectedArtifact.type === 'mermaid') {
       if (!selectedArtifact.content) return;
@@ -867,7 +950,7 @@ const ArtifactPanel: React.FC<ArtifactPanelProps> = ({
     if (html) {
       window.electron?.shell?.openHtmlInBrowser(html);
     }
-  }, [selectedArtifact]);
+  }, [onOpenHtmlFileInBrowser, selectedArtifact]);
 
   const openSubscriptionPage = useCallback(() => {
     window.electron?.shell?.openExternal(getPortalPricingUrl(PortalPricingKeyfrom.HtmlShare));
@@ -923,12 +1006,12 @@ const ArtifactPanel: React.FC<ArtifactPanelProps> = ({
   const handleCopyShareLink = useCallback(
     async (url?: string, shareCode?: string) => {
       if (!url) return;
-      try {
-        await navigator.clipboard.writeText(formatShareClipboardText(url, shareCode));
+      const copied = await copyTextToClipboard(formatShareClipboardText(url, shareCode));
+      if (copied) {
         showHtmlShareCopyStatus(HtmlShareCopyStatus.Copied);
-      } catch {
-        showHtmlShareCopyStatus(HtmlShareCopyStatus.Failed);
+        return;
       }
+      showHtmlShareCopyStatus(HtmlShareCopyStatus.Failed);
     },
     [formatShareClipboardText, showHtmlShareCopyStatus],
   );
@@ -1250,9 +1333,9 @@ const ArtifactPanel: React.FC<ArtifactPanelProps> = ({
 
   const handleShareHtmlArtifact = useCallback(async () => {
     if (
-      !selectedArtifact ||
+      !htmlShareArtifact ||
       !selectedHtmlFilePath ||
-      selectedArtifact.type !== ArtifactTypeValue.Html ||
+      htmlShareArtifact.type !== ArtifactTypeValue.Html ||
       isHtmlSharing
     )
       return;
@@ -1260,9 +1343,9 @@ const ArtifactPanel: React.FC<ArtifactPanelProps> = ({
     const request: HtmlSharePendingRequest = {
       source: HtmlSharePendingSource.HtmlFile,
       sessionId,
-      artifactId: selectedArtifact.id,
+      artifactId: htmlShareArtifact.id,
       filePath: selectedHtmlFilePath,
-      title: selectedArtifact.title || selectedArtifact.fileName || t('htmlShare'),
+      title: htmlShareArtifact.title || htmlShareArtifact.fileName || t('htmlShare'),
     };
     try {
       if (selectedHtmlShare) {
@@ -1300,7 +1383,7 @@ const ArtifactPanel: React.FC<ArtifactPanelProps> = ({
     isHtmlSharing,
     openExistingHtmlShareDialog,
     rememberHtmlShare,
-    selectedArtifact,
+    htmlShareArtifact,
     selectedHtmlFilePath,
     selectedHtmlShare,
     sessionId,
@@ -1424,15 +1507,21 @@ const ArtifactPanel: React.FC<ArtifactPanelProps> = ({
   return (
     <>
       {/* Drag handle */}
-      <div
-        className="w-1 shrink-0 touch-none cursor-col-resize hover:bg-primary/30 active:bg-primary/50 transition-colors"
-        onPointerDown={handleResizeStart}
-      />
+      {!isPanelExpanded && (
+        <div
+          className="w-1 shrink-0 touch-none cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50"
+          onPointerDown={handleResizeStart}
+        />
+      )}
       <aside
-        style={{ width: constrainedPanelWidth, maxWidth: constrainedMaxPanelWidth }}
-        className="shrink border-l border-border bg-background flex flex-col h-full overflow-hidden relative"
+        style={isPanelExpanded
+          ? { width: '100%', maxWidth: 'none' }
+          : { width: constrainedPanelWidth, maxWidth: constrainedMaxPanelWidth }}
+        className={`bg-background flex flex-col h-full overflow-hidden relative ${
+          isPanelExpanded ? 'min-w-0 flex-1' : 'shrink border-l border-border'
+        }`}
       >
-        {panelIsResizing && (
+        {!isPanelExpanded && panelIsResizing && (
           <div className="absolute inset-0 z-30 cursor-col-resize bg-transparent" />
         )}
 
@@ -1464,8 +1553,18 @@ const ArtifactPanel: React.FC<ArtifactPanelProps> = ({
                   {isArtifactActionsMenuOpen && (
                     <div
                       ref={artifactActionsMenuRef}
-                      className="absolute right-0 top-7 z-40 w-32 rounded-lg border border-border bg-surface-raised p-1.5 text-sm text-foreground shadow-xl"
+                      className="absolute right-0 top-7 z-40 w-44 rounded-lg border border-border bg-surface-raised p-1.5 text-sm text-foreground shadow-xl"
                     >
+                      {showContentViewActionInMenu && (
+                        <button
+                          type="button"
+                          onClick={() => runArtifactMenuAction(() => handleSetContentView(contentViewActionTarget))}
+                          className="flex h-8 w-full items-center gap-2 rounded-md px-2 text-left text-xs transition-colors hover:bg-surface"
+                        >
+                          <ContentViewIcon />
+                          <span>{contentViewActionLabel}</span>
+                        </button>
+                      )}
                       {showRefreshAction && (
                         <button
                           type="button"
@@ -1515,6 +1614,24 @@ const ArtifactPanel: React.FC<ArtifactPanelProps> = ({
                           <FolderIcon />
                           <span>{t('artifactOpenFolder')}</span>
                         </button>
+                      )}
+                      {officePreviewZoomControls && (
+                        <div
+                          className={`${hasArtifactActionMenuItems ? 'mt-1 border-t border-border/70 pt-1.5' : ''} px-1 py-1`}
+                        >
+                          <div className="flex h-8 items-center gap-1.5">
+                            <span className="shrink-0 whitespace-nowrap text-xs text-secondary">
+                              {t('artifactBrowserZoom')}
+                            </span>
+                            <OfficeZoomControls
+                              zoomFactor={officePreviewZoomControls.zoomFactor}
+                              displayZoomFactor={officePreviewZoomControls.displayZoomFactor}
+                              onZoomOut={officePreviewZoomControls.onZoomOut}
+                              onZoomIn={officePreviewZoomControls.onZoomIn}
+                              onResetZoom={officePreviewZoomControls.onResetZoom}
+                            />
+                          </div>
+                        </div>
                       )}
                     </div>
                   )}
@@ -1595,45 +1712,19 @@ const ArtifactPanel: React.FC<ArtifactPanelProps> = ({
               </div>
             )}
 
-            {/* Preview/Code tabs */}
-            <div
-              className={`flex border-b border-border shrink-0 ${isDocumentArtifact ? 'pl-4' : ''}`}
-            >
-              <button
-                onClick={() => handleSetContentView(ArtifactContentView.Preview)}
-                className={`${isDocumentArtifact ? 'px-0' : 'px-3'} py-1.5 text-xs font-medium transition-colors border-b-2 ${
-                  activeTab === ArtifactContentView.Preview
-                    ? 'border-primary text-primary'
-                    : 'border-transparent text-secondary hover:text-foreground'
-                }`}
-              >
-                {t('artifactPreview')}
-              </button>
-              {!NON_CODE_TYPES.has(selectedArtifact.type) && (
-                <button
-                  onClick={() => handleSetContentView(ArtifactContentView.Code)}
-                  className={`px-3 py-1.5 text-xs font-medium transition-colors border-b-2 ${
-                    activeTab === ArtifactContentView.Code
-                      ? 'border-primary text-primary'
-                      : 'border-transparent text-secondary hover:text-foreground'
-                  }`}
-                >
-                  {t('artifactCode')}
-                </button>
-              )}
-            </div>
-
             {/* Render area */}
             <div className="flex-1 min-h-0 overflow-hidden">
-              {activeTab === ArtifactContentView.Preview ? (
-                <ArtifactRenderer
-                  artifact={selectedArtifact}
-                  sessionArtifacts={artifacts}
-                  selectedTextContext={selectedTextContext}
-                />
-              ) : (
-                <CodeRenderer artifact={selectedArtifact} />
-              )}
+              <OfficePreviewActionsContext.Provider value={officePreviewActionsContextValue}>
+                {!isCodeViewActive ? (
+                  <ArtifactRenderer
+                    artifact={selectedArtifact}
+                    sessionArtifacts={artifacts}
+                    selectedTextContext={selectedTextContext}
+                  />
+                ) : (
+                  <CodeRenderer artifact={selectedArtifact} />
+                )}
+              </OfficePreviewActionsContext.Provider>
             </div>
           </div>
         ) : activeSpecialTab === ArtifactSpecialTab.Browser ? (
@@ -1641,6 +1732,13 @@ const ArtifactPanel: React.FC<ArtifactPanelProps> = ({
             address={browserAddress}
             currentUrl={browserUrl}
             sessionArtifacts={artifacts}
+            canShare={canShareHtmlArtifact}
+            shareButtonTitle={htmlShareButtonTitle}
+            hasExistingShare={Boolean(selectedHtmlShare)}
+            isSharing={isHtmlSharing}
+            onShare={handleShareHtmlArtifact}
+            autoRefreshFilePath={browserHtmlAutoRefreshFilePath}
+            localHtmlPreviewUrl={browserHtmlPreviewUrl}
             onAddressChange={handleBrowserAddressChange}
             onCurrentUrlChange={handleBrowserUrlChange}
             onAnnotationCaptured={onBrowserAnnotationCaptured}
@@ -1850,7 +1948,7 @@ type BrowserAnnotationStatus =
 
 const BrowserToolbarAction = {
   Annotate: 'annotate',
-  Screenshot: 'screenshot',
+  Share: 'share',
   OpenExternal: 'openExternal',
 } as const;
 
@@ -1997,6 +2095,21 @@ function normalizeBrowserUrl(value: string): string | null {
     return `https://${trimmed}`;
   }
   return `https://www.google.com/search?q=${encodeURIComponent(trimmed)}`;
+}
+
+function normalizeBrowserPreviewUrlForMatch(value: string): string {
+  try {
+    const url = new URL(value);
+    url.hash = '';
+    return url.toString();
+  } catch {
+    return value;
+  }
+}
+
+function isSameBrowserPreviewUrl(value: string, previewUrl: string): boolean {
+  if (!value || !previewUrl) return false;
+  return normalizeBrowserPreviewUrlForMatch(value) === normalizeBrowserPreviewUrlForMatch(previewUrl);
 }
 
 function clampBrowserZoomFactor(value: number): number {
@@ -2319,6 +2432,13 @@ interface BrowserTabContentProps {
   address: string;
   currentUrl: string;
   sessionArtifacts?: Artifact[];
+  canShare?: boolean;
+  shareButtonTitle?: string;
+  hasExistingShare?: boolean;
+  isSharing?: boolean;
+  onShare?: () => void | Promise<void>;
+  autoRefreshFilePath?: string;
+  localHtmlPreviewUrl?: string;
   onAddressChange: (value: string) => void;
   onCurrentUrlChange: (value: string) => void;
   onAnnotationCaptured?: (payload: BrowserAnnotationPayload) => void;
@@ -2328,6 +2448,13 @@ const BrowserTabContent: React.FC<BrowserTabContentProps> = ({
   address,
   currentUrl,
   sessionArtifacts,
+  canShare = false,
+  shareButtonTitle = t('htmlShare'),
+  hasExistingShare = false,
+  isSharing = false,
+  onShare,
+  autoRefreshFilePath,
+  localHtmlPreviewUrl,
   onAddressChange,
   onCurrentUrlChange,
   onAnnotationCaptured,
@@ -2359,11 +2486,12 @@ const BrowserTabContent: React.FC<BrowserTabContentProps> = ({
   const [deviceHeight, setDeviceHeight] = useState<number>(BrowserDeviceViewport.DefaultHeight);
   const [deviceScale, setDeviceScale] = useState<number>(BrowserDeviceScale.Default);
   const annotateButtonRef = useRef<HTMLDivElement>(null);
-  const screenshotButtonRef = useRef<HTMLDivElement>(null);
+  const shareButtonRef = useRef<HTMLDivElement>(null);
   const openExternalButtonRef = useRef<HTMLDivElement>(null);
   const browserMenuButtonRef = useRef<HTMLButtonElement>(null);
   const browserMenuRef = useRef<HTMLDivElement>(null);
   const screenshotStatusTimeoutRef = useRef<number | undefined>(undefined);
+  const autoRefreshTimeoutRef = useRef<number | undefined>(undefined);
   const lastRequestedUrlRef = useRef('');
   const lastRequestedWebviewRef = useRef<BrowserWebviewElement | null>(null);
   const webviewNodeRef = useRef<BrowserWebviewElement | null>(null);
@@ -2376,6 +2504,9 @@ const BrowserTabContent: React.FC<BrowserTabContentProps> = ({
     () => () => {
       if (screenshotStatusTimeoutRef.current !== undefined) {
         window.clearTimeout(screenshotStatusTimeoutRef.current);
+      }
+      if (autoRefreshTimeoutRef.current !== undefined) {
+        window.clearTimeout(autoRefreshTimeoutRef.current);
       }
     },
     [],
@@ -2438,6 +2569,20 @@ const BrowserTabContent: React.FC<BrowserTabContentProps> = ({
     };
   }, [isBrowserMenuOpen]);
 
+  const getBrowserAddressForUrl = useCallback(
+    (nextUrl: string): string => {
+      if (
+        autoRefreshFilePath &&
+        localHtmlPreviewUrl &&
+        isSameBrowserPreviewUrl(nextUrl, localHtmlPreviewUrl)
+      ) {
+        return autoRefreshFilePath;
+      }
+      return nextUrl;
+    },
+    [autoRefreshFilePath, localHtmlPreviewUrl],
+  );
+
   const syncNavigationState = useCallback(
     (node: BrowserWebviewElement | null) => {
       if (!node) return;
@@ -2446,10 +2591,10 @@ const BrowserTabContent: React.FC<BrowserTabContentProps> = ({
       const nextUrl = node.getURL?.();
       if (nextUrl && nextUrl !== BrowserPageUrl.Blank) {
         onCurrentUrlChange(nextUrl);
-        onAddressChange(nextUrl);
+        onAddressChange(getBrowserAddressForUrl(nextUrl));
       }
     },
-    [onAddressChange, onCurrentUrlChange],
+    [getBrowserAddressForUrl, onAddressChange, onCurrentUrlChange],
   );
 
   const getToolbarActionElement = useCallback(
@@ -2457,8 +2602,8 @@ const BrowserTabContent: React.FC<BrowserTabContentProps> = ({
       switch (action) {
         case BrowserToolbarAction.Annotate:
           return annotateButtonRef.current;
-        case BrowserToolbarAction.Screenshot:
-          return screenshotButtonRef.current;
+        case BrowserToolbarAction.Share:
+          return shareButtonRef.current;
         case BrowserToolbarAction.OpenExternal:
           return openExternalButtonRef.current;
         default:
@@ -2505,7 +2650,7 @@ const BrowserTabContent: React.FC<BrowserTabContentProps> = ({
       const nextUrl = (event as Event & { url?: string }).url;
       if (nextUrl && nextUrl !== BrowserPageUrl.Blank) {
         onCurrentUrlChange(nextUrl);
-        onAddressChange(nextUrl);
+        onAddressChange(getBrowserAddressForUrl(nextUrl));
       }
       syncNavigationState(webviewNode);
     };
@@ -2535,12 +2680,46 @@ const BrowserTabContent: React.FC<BrowserTabContentProps> = ({
       webviewNode.removeEventListener('did-navigate-in-page', handleNavigate);
       webviewNode.removeEventListener('dom-ready', handleDomReady);
     };
-  }, [browserZoomFactor, onAddressChange, onCurrentUrlChange, syncNavigationState, webviewNode]);
+  }, [
+    browserZoomFactor,
+    getBrowserAddressForUrl,
+    onAddressChange,
+    onCurrentUrlChange,
+    syncNavigationState,
+    webviewNode,
+  ]);
 
   useEffect(() => {
     if (!isWebviewReady || !webviewNode?.setZoomFactor) return;
     webviewNode.setZoomFactor(browserZoomFactor);
   }, [browserZoomFactor, isWebviewReady, webviewNode]);
+
+  useEffect(() => {
+    if (!autoRefreshFilePath || !currentUrl) return;
+
+    let cleanup: (() => void) | undefined;
+    const watchedPath = autoRefreshFilePath;
+    window.electron?.artifact?.watchFile(watchedPath);
+    cleanup = window.electron?.artifact?.onFileChanged(({ filePath: changedPath }) => {
+      if (changedPath !== watchedPath) return;
+      if (autoRefreshTimeoutRef.current !== undefined) {
+        window.clearTimeout(autoRefreshTimeoutRef.current);
+      }
+      autoRefreshTimeoutRef.current = window.setTimeout(() => {
+        autoRefreshTimeoutRef.current = undefined;
+        webviewNodeRef.current?.reload?.();
+      }, 120);
+    });
+
+    return () => {
+      if (autoRefreshTimeoutRef.current !== undefined) {
+        window.clearTimeout(autoRefreshTimeoutRef.current);
+        autoRefreshTimeoutRef.current = undefined;
+      }
+      cleanup?.();
+      window.electron?.artifact?.unwatchFile(watchedPath);
+    };
+  }, [autoRefreshFilePath, currentUrl]);
 
   useEffect(() => {
     if (!currentUrl || !isWebviewReady || !webviewNode?.loadURL) return;
@@ -2577,11 +2756,29 @@ const BrowserTabContent: React.FC<BrowserTabContentProps> = ({
   }, [currentUrl, isWebviewReady, webviewNode]);
 
   const handleNavigate = useCallback(() => {
+    const trimmedAddress = address.trim();
+    if (
+      autoRefreshFilePath &&
+      localHtmlPreviewUrl &&
+      trimmedAddress === autoRefreshFilePath
+    ) {
+      onCurrentUrlChange(localHtmlPreviewUrl);
+      onAddressChange(autoRefreshFilePath);
+      webviewNodeRef.current?.reload?.();
+      return;
+    }
+
     const nextUrl = normalizeBrowserUrl(address);
     if (!nextUrl) return;
     onCurrentUrlChange(nextUrl);
     onAddressChange(nextUrl);
-  }, [address, onAddressChange, onCurrentUrlChange]);
+  }, [
+    address,
+    autoRefreshFilePath,
+    localHtmlPreviewUrl,
+    onAddressChange,
+    onCurrentUrlChange,
+  ]);
 
   const handleOpenLocalService = useCallback(
     (service: LocalWebService) => {
@@ -2745,6 +2942,11 @@ const BrowserTabContent: React.FC<BrowserTabContentProps> = ({
     }
   }, [currentUrl, isCapturingScreenshot, setTemporaryScreenshotStatus, webviewNode]);
 
+  const handleCaptureScreenshotFromMenu = useCallback(() => {
+    setIsBrowserMenuOpen(false);
+    void handleCaptureScreenshot();
+  }, [handleCaptureScreenshot]);
+
   const handleToggleAnnotation = useCallback(async () => {
     if (!webviewNode?.executeJavaScript || !webviewNode.capturePage || !currentUrl) return;
     if (isAnnotating) {
@@ -2816,8 +3018,8 @@ const BrowserTabContent: React.FC<BrowserTabContentProps> = ({
   const hoveredToolbarLabel =
     hoveredToolbarAction === BrowserToolbarAction.Annotate
       ? t('artifactBrowserAnnotate')
-      : hoveredToolbarAction === BrowserToolbarAction.Screenshot
-        ? t('artifactBrowserScreenshot')
+      : hoveredToolbarAction === BrowserToolbarAction.Share
+        ? shareButtonTitle
         : hoveredToolbarAction === BrowserToolbarAction.OpenExternal
           ? t('artifactBrowserOpenExternal')
           : '';
@@ -2894,30 +3096,26 @@ const BrowserTabContent: React.FC<BrowserTabContentProps> = ({
           </button>
         )}
         <div
-          ref={screenshotButtonRef}
+          ref={shareButtonRef}
           className="flex h-7 w-7 shrink-0 items-center justify-center"
-          onMouseEnter={() => setHoveredToolbarAction(BrowserToolbarAction.Screenshot)}
+          onMouseEnter={() => setHoveredToolbarAction(BrowserToolbarAction.Share)}
           onMouseLeave={() => setHoveredToolbarAction(null)}
         >
           <button
             type="button"
-            onClick={handleCaptureScreenshot}
-            disabled={!currentUrl || isCapturingScreenshot}
+            onClick={() => void onShare?.()}
+            disabled={!canShare || isSharing}
             className={`inline-flex h-7 w-7 items-center justify-center rounded transition-colors disabled:cursor-not-allowed disabled:opacity-35 ${
-              screenshotStatus === BrowserScreenshotStatus.Copied
-                ? 'text-primary hover:bg-surface'
-                : screenshotStatus === BrowserScreenshotStatus.Error
-                  ? 'text-red-500 hover:bg-surface'
-                  : 'text-secondary hover:bg-surface hover:text-foreground'
+              hasExistingShare
+                ? 'bg-primary/10 text-primary hover:bg-primary/20'
+                : canShare
+                ? 'text-secondary hover:bg-surface hover:text-foreground'
+                : 'text-secondary'
             }`}
-            aria-label={t('artifactBrowserScreenshot')}
-            title={screenshotButtonTitle}
+            aria-label={shareButtonTitle}
+            title={shareButtonTitle}
           >
-            {screenshotStatus === BrowserScreenshotStatus.Copied ? (
-              <ScreenshotCopiedIcon />
-            ) : (
-              <ScreenshotIcon />
-            )}
+            <ShareIcon />
           </button>
         </div>
         <div
@@ -2957,6 +3155,15 @@ const BrowserTabContent: React.FC<BrowserTabContentProps> = ({
           ref={browserMenuRef}
           className="absolute right-3 top-10 z-40 w-56 rounded-lg border border-border bg-surface-raised p-2 text-sm text-foreground shadow-xl"
         >
+          <button
+            type="button"
+            onClick={handleCaptureScreenshotFromMenu}
+            disabled={!currentUrl || isCapturingScreenshot}
+            className="flex h-8 w-full items-center rounded-md px-2 text-left text-xs transition-colors hover:bg-surface disabled:cursor-not-allowed disabled:opacity-35"
+          >
+            {screenshotButtonTitle}
+          </button>
+          <div className="my-1 border-t border-border" />
           <button
             type="button"
             onClick={handleOpenBlankPage}
@@ -3263,37 +3470,6 @@ const AnnotateIcon = () => (
   </svg>
 );
 
-const ScreenshotIcon = () => (
-  <svg
-    width="14"
-    height="14"
-    viewBox="0 0 16 16"
-    fill="none"
-    stroke="currentColor"
-    strokeWidth="1.5"
-    strokeLinecap="round"
-    strokeLinejoin="round"
-  >
-    <path d="M5.25 4.25l.55-1.1A1.5 1.5 0 017.14 2.3h1.72a1.5 1.5 0 011.34.85l.55 1.1h1.75A1.5 1.5 0 0114 5.75v6A1.5 1.5 0 0112.5 13h-9A1.5 1.5 0 012 11.75v-6a1.5 1.5 0 011.5-1.5h1.75z" />
-    <circle cx="8" cy="8.6" r="2.3" />
-  </svg>
-);
-
-const ScreenshotCopiedIcon = () => (
-  <svg
-    width="14"
-    height="14"
-    viewBox="0 0 16 16"
-    fill="none"
-    stroke="currentColor"
-    strokeWidth="1.6"
-    strokeLinecap="round"
-    strokeLinejoin="round"
-  >
-    <path d="M3.5 8.2l3 3 6-6.4" />
-  </svg>
-);
-
 const ChevronLeftIcon = () => (
   <svg
     width="14"
@@ -3380,6 +3556,24 @@ const MoreHorizontalToolbarIcon = () => (
     <circle cx="4" cy="8.6" r="1.15" />
     <circle cx="8" cy="8.6" r="1.15" />
     <circle cx="12" cy="8.6" r="1.15" />
+  </svg>
+);
+
+const ContentViewIcon = () => (
+  <svg
+    width="14"
+    height="14"
+    viewBox="0 0 16 16"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="1.5"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    aria-hidden="true"
+  >
+    <path d="M2.5 3.5h11" />
+    <path d="M2.5 8h11" />
+    <path d="M2.5 12.5h6" />
   </svg>
 );
 

@@ -6,11 +6,15 @@
 const ERROR_RULES: Array<[RegExp, string]> = [
   // Auth: Anthropic, DeepSeek, OpenAI, Gemini, HTTP 401
   [/authentication[_ ](error|fails?)|api[_ ]key.*(invalid|expired|not[_ ]valid)|invalid.*api.*key|incorrect.*api.*key|unauthorized|PERMISSION_DENIED|\b401\b/i, 'coworkErrorAuthInvalid'],
+  // LobsterAI free tier quota.
+  [/免费额度.*(用完|耗尽)|free.*quota.*(exhausted|used up|limit)/i, 'coworkErrorFreeQuotaExhausted'],
   // Rate limit: HTTP 429, Anthropic/DeepSeek overloaded, Gemini RESOURCE_EXHAUSTED
   // (must precede billing so "RESOURCE_EXHAUSTED: quota exceeded" maps to rate-limit)
   [/\b429\b|rate[_ ]limit|too many requests|overloaded|RESOURCE_EXHAUSTED/i, 'coworkErrorRateLimit'],
   // Billing: DeepSeek 402, OpenAI, OpenRouter, Qwen, StepFun
   [/insufficient.*(balance|quota|credits)|billing|quota[_ ]exceeded|Arrearage|account.*not.*in.*good.*standing|余额不足|\b402\b/i, 'coworkErrorInsufficientBalance'],
+  // Oversized Cowork/OpenClaw gateway message payloads.
+  [/chat\.send payload too large|max payload size exceeded|gateway closed \(1009\)|message too big/i, 'coworkErrorMessageTooLarge'],
   // Input too long: context length, HTTP 413, Qwen, payload too large
   [/input.*too.*long|context.*length.*exceeded|range of input length|\b413\b|payload.*too.*large|request.*entity.*too.*large|max[_ ]tokens/i, 'coworkErrorInputTooLong'],
   // PDF processing failure

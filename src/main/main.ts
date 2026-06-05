@@ -14,7 +14,6 @@ import {
   protocol,
   session,
   shell,
-  systemPreferences,
   type WebContents,
 } from 'electron';
 import fs from 'fs';
@@ -82,6 +81,11 @@ import {
   type LocalWebService,
   LocalWebServicesIpc,
 } from '../shared/localWebServices/constants';
+import { canonicalizeMediaModelId, mediaModelDisplayName } from '../shared/mediaModelAliases';
+import {
+  OpenClawEngineIpc,
+  OpenClawGatewayRepairErrorCode,
+} from '../shared/openclawEngine/constants';
 import { PlatformRegistry } from '../shared/platform';
 import { ProviderName } from '../shared/providers';
 import type { ShellOpenFailureReason as ShellOpenFailureReasonType } from '../shared/shell/constants';
@@ -111,10 +115,12 @@ import type {
   TelegramInstanceConfig,
   WecomInstanceConfig,
 } from './im/types';
+import { registerAsrIpcHandlers } from './ipcHandlers/asr';
 import { registerCoworkSubagentHandlers } from './ipcHandlers/coworkSubagent';
 import { registerKitHandlers } from './ipcHandlers/kits';
 import { registerMcpHandlers } from './ipcHandlers/mcp';
 import { registerNimQrLoginHandlers } from './ipcHandlers/nimQrLogin';
+import { registerPermissionIpcHandlers } from './ipcHandlers/permissions/handlers';
 import { registerPluginHandlers } from './ipcHandlers/plugins';
 import {
   getCronJobService,
@@ -189,7 +195,7 @@ import {
 import { packageHtmlFile } from './libs/htmlShare/htmlSharePackager';
 import { getKeyfromAttribution, initializeKeyfromAttribution } from './libs/keyfromAttribution';
 import { exportLogsZip } from './libs/logExport';
-import { type PersistedGeneratedImageAsset, persistGeneratedImageAssets, type PersistGeneratedImageAssetsResult, persistGeneratedVideoAssets, type RemoteGeneratedMediaAsset } from './libs/mediaAssetPersistence';
+import { inferImageMimeTypeFromDataUrl, type PersistedGeneratedImageAsset, persistGeneratedImageAssets, type PersistGeneratedImageAssetsResult, persistGeneratedVideoAssets, type RemoteGeneratedMediaAsset } from './libs/mediaAssetPersistence';
 import { migrateAgentModelRefs, parsePrimaryModelRef, resolveQualifiedAgentModelRef } from './libs/openclawAgentModels';
 import {
   buildManagedSessionKey,
@@ -208,6 +214,10 @@ import {
 } from './libs/openclawConfigImpact';
 import { buildProviderSelection, OpenClawConfigSync } from './libs/openclawConfigSync';
 import { OpenClawEngineManager, type OpenClawEngineStatus } from './libs/openclawEngineManager';
+import {
+  backupOpenClawConfig,
+  getOpenClawGatewayRepairBusyError,
+} from './libs/openclawGatewayRepair';
 import {
   addMemoryEntry,
   deleteMemoryEntry,
@@ -255,6 +265,7 @@ import {
   loadOpenClawSessionPolicyConfig,
   saveOpenClawSessionPolicyConfig,
 } from './openclawSessionPolicy/store';
+import { registerVoiceInputPermissionHandler } from './permissions/voiceInputPermission';
 import { SkillManager } from './skillManager';
 import { getSkillServiceManager } from './skillServices';
 import { SqliteStore } from './sqliteStore';
@@ -1102,108 +1113,6 @@ const normalizeWindowsShellPath = (inputPath: string): string => {
   return normalized;
 };
 
-// ==================== macOS Permissions ====================
-
-/**
- * Check calendar permission on macOS by attempting to access Calendar app
- * Returns: 'authorized' | 'denied' | 'restricted' | 'not-determined'
- * On Windows, checks if Outlook is available
- * On Linux, returns 'not-supported'
- */
-const checkCalendarPermission = async (): Promise<string> => {
-  if (process.platform === 'darwin') {
-    try {
-      // Try to access Calendar to check permission
-      const { exec } = require('child_process');
-      const util = require('util');
-      const execAsync = util.promisify(exec);
-
-      // Quick test to see if we can access Calendar
-      await execAsync('osascript -l JavaScript -e \'Application("Calendar").name()\'', {
-        timeout: 5000,
-      });
-      console.log('[Permissions] macOS Calendar access: authorized');
-      return 'authorized';
-    } catch (error: unknown) {
-      const stderr =
-        typeof error === 'object' && error && 'stderr' in error
-          ? String((error as { stderr?: unknown }).stderr ?? '')
-          : '';
-      // Check if it's a permission error
-      if (
-        stderr.includes('不能获取对象') ||
-        stderr.includes('not authorized') ||
-        stderr.includes('Permission denied')
-      ) {
-        console.log('[Permissions] macOS Calendar access: not-determined (needs permission)');
-        return 'not-determined';
-      }
-      console.warn('[Permissions] Failed to check macOS calendar permission:', error);
-      return 'not-determined';
-    }
-  }
-
-  if (process.platform === 'win32') {
-    // Windows doesn't have a system-level calendar permission like macOS
-    // Instead, we check if Outlook is available
-    try {
-      const { exec } = require('child_process');
-      const util = require('util');
-      const execAsync = util.promisify(exec);
-
-      // Check if Outlook COM object is accessible
-      const checkScript = `
-        try {
-          $Outlook = New-Object -ComObject Outlook.Application
-          $Outlook.Version
-        } catch { exit 1 }
-      `;
-      await execAsync('powershell -Command "' + checkScript + '"', { timeout: 10000 });
-      console.log('[Permissions] Windows Outlook is available');
-      return 'authorized';
-    } catch {
-      console.log('[Permissions] Windows Outlook not available or not accessible');
-      return 'not-determined';
-    }
-  }
-
-  return 'not-supported';
-};
-
-/**
- * Request calendar permission on macOS
- * On Windows, attempts to initialize Outlook COM object
- */
-const requestCalendarPermission = async (): Promise<boolean> => {
-  if (process.platform === 'darwin') {
-    try {
-      // On macOS, we trigger permission by trying to access Calendar
-      // The system will show permission dialog if needed
-      const { exec } = require('child_process');
-      const util = require('util');
-      const execAsync = util.promisify(exec);
-
-      await execAsync(
-        'osascript -l JavaScript -e \'Application("Calendar").calendars()[0].name()\'',
-        { timeout: 10000 },
-      );
-      return true;
-    } catch (error) {
-      console.warn('[Permissions] Failed to request macOS calendar permission:', error);
-      return false;
-    }
-  }
-
-  if (process.platform === 'win32') {
-    // Windows doesn't have a permission dialog for COM objects
-    // We just check if Outlook is available
-    const status = await checkCalendarPermission();
-    return status === 'authorized';
-  }
-
-  return false;
-};
-
 // 配置应用
 // Linux/Windows 禁用 Chromium 沙箱：桌面应用渲染自有代码，风险可控；
 // Windows 下以管理员运行时沙箱无法降权会导致 GPU 进程启动失败 (error_code=18)
@@ -1347,7 +1256,7 @@ const forwardOpenClawStatus = (status: OpenClawEngineStatus): void => {
   windows.forEach(win => {
     if (win.isDestroyed()) return;
     try {
-      win.webContents.send('openclaw:engine:onProgress', status);
+      win.webContents.send(OpenClawEngineIpc.OnProgress, status);
     } catch (error) {
       console.error('Failed to forward OpenClaw engine status:', error);
     }
@@ -2023,6 +1932,141 @@ const syncOpenClawConfig = async (
   }
 };
 
+type OpenClawGatewayRepairResult = {
+  success: boolean;
+  status?: OpenClawEngineStatus;
+  originalPath: string;
+  backupPath?: string;
+  error?: string;
+  errorCode?: OpenClawGatewayRepairErrorCode;
+  recoverable?: boolean;
+};
+
+let openClawGatewayRepairPromise: Promise<OpenClawGatewayRepairResult> | null = null;
+
+const isOpenClawGatewayRepairSuccess = (status: OpenClawEngineStatus): boolean => {
+  return status.phase === 'running' || status.phase === 'ready';
+};
+
+const buildOpenClawRepairBusyResult = (
+  originalPath: string,
+  status: OpenClawEngineStatus,
+): OpenClawGatewayRepairResult | null => {
+  const busyError = getOpenClawGatewayRepairBusyError(hasActiveGatewayWorkloads());
+  if (!busyError) {
+    return null;
+  }
+  return {
+    success: false,
+    status,
+    originalPath,
+    error: busyError,
+    errorCode: OpenClawGatewayRepairErrorCode.Busy,
+    recoverable: true,
+  };
+};
+
+const repairOpenClawGatewayState = (): Promise<OpenClawGatewayRepairResult> => {
+  if (openClawGatewayRepairPromise) {
+    console.log('[OpenClawRepair] repair already in progress, joining existing request.');
+    return openClawGatewayRepairPromise;
+  }
+
+  let promise: Promise<OpenClawGatewayRepairResult>;
+  promise = (async (): Promise<OpenClawGatewayRepairResult> => {
+    const manager = getOpenClawEngineManager();
+    const originalPath = manager.getConfigPath();
+
+    const initialBusyResult = buildOpenClawRepairBusyResult(originalPath, manager.getStatus());
+    if (initialBusyResult) {
+      console.warn('[OpenClawRepair] repair was blocked because gateway work is still running.');
+      return initialBusyResult;
+    }
+
+    const pendingApplyStatus = await waitForOpenClawConfigApply('manual OpenClaw repair');
+    if (pendingApplyStatus) {
+      console.warn('[OpenClawRepair] repair was blocked while configuration changes are still applying.');
+      return {
+        success: false,
+        status: pendingApplyStatus,
+        originalPath,
+        error: pendingApplyStatus.message || 'OpenClaw is still applying configuration changes.',
+        errorCode: OpenClawGatewayRepairErrorCode.ConfigApplyPending,
+        recoverable: true,
+      };
+    }
+
+    const postApplyBusyResult = buildOpenClawRepairBusyResult(originalPath, manager.getStatus());
+    if (postApplyBusyResult) {
+      console.warn('[OpenClawRepair] repair was blocked because gateway work started during the check.');
+      return postApplyBusyResult;
+    }
+
+    if (openClawBootstrapPromise) {
+      console.log('[OpenClawRepair] waiting for the current OpenClaw startup attempt to finish.');
+      await openClawBootstrapPromise.catch((error: unknown): null => {
+        console.warn('[OpenClawRepair] existing startup attempt failed before repair:', error);
+        return null;
+      });
+    }
+
+    const postBootstrapBusyResult = buildOpenClawRepairBusyResult(originalPath, manager.getStatus());
+    if (postBootstrapBusyResult) {
+      console.warn('[OpenClawRepair] repair was blocked because gateway work started after startup finished.');
+      return postBootstrapBusyResult;
+    }
+
+    try {
+      console.log('[OpenClawRepair] starting gateway state repair.');
+      if (openClawRuntimeAdapter) {
+        openClawRuntimeAdapter.disconnectGatewayClient();
+      }
+
+      await manager.stopGateway();
+      const backupResult = backupOpenClawConfig(originalPath);
+      if (backupResult.backupPath) {
+        console.log(`[OpenClawRepair] backed up OpenClaw config to ${backupResult.backupPath}.`);
+      } else {
+        console.log('[OpenClawRepair] no OpenClaw config file was present, continuing with regeneration.');
+      }
+
+      const status = await bootstrapOpenClawEngine({
+        forceReinstall: false,
+        reason: 'manual-repair',
+      });
+      const success = isOpenClawGatewayRepairSuccess(status);
+      if (success) {
+        console.log('[OpenClawRepair] gateway state repair completed successfully.');
+      } else {
+        console.warn('[OpenClawRepair] gateway state repair completed but the gateway is not ready.');
+      }
+
+      return {
+        success,
+        status,
+        originalPath: backupResult.originalPath,
+        backupPath: backupResult.backupPath,
+        error: success ? undefined : status.message || 'Failed to restart OpenClaw gateway after repair.',
+      };
+    } catch (error) {
+      console.error('[OpenClawRepair] gateway state repair failed:', error);
+      return {
+        success: false,
+        status: manager.getStatus(),
+        originalPath,
+        error: error instanceof Error ? error.message : 'Failed to repair OpenClaw gateway state.',
+      };
+    }
+  })().finally(() => {
+    if (openClawGatewayRepairPromise === promise) {
+      openClawGatewayRepairPromise = null;
+    }
+  });
+
+  openClawGatewayRepairPromise = promise;
+  return promise;
+};
+
 const bindCoworkRuntimeForwarder = (): void => {
   if (coworkRuntimeForwarderBound) return;
   const runtime = getCoworkEngineRouter();
@@ -2551,6 +2595,13 @@ const mediaReferencesBySession = new Map<string, MediaAttachmentRefMain[]>();
 const persistedGeneratedImageAssetsByUrl = new Map<string, PersistedGeneratedImageAsset>();
 const persistedGeneratedVideoAssetsByUrl = new Map<string, PersistedGeneratedImageAsset>();
 
+const resolveGeneratedMediaAssetMimeType = (mediaType: 'image' | 'video', url: string): string => {
+  if (mediaType === 'image') {
+    return inferImageMimeTypeFromDataUrl(url) || 'image/png';
+  }
+  return 'video/mp4';
+};
+
 // Async video task polling (FR-8)
 interface MediaTaskTracker {
   taskId: string;
@@ -2575,6 +2626,32 @@ const MEDIA_POLL_SLOW_COUNT = 18;
 const MEDIA_POLL_MEDIUM_COUNT = 10;
 const MEDIA_TASK_DEFAULT_TIMEOUT_MS = 172_800_000;
 const TERMINAL_MEDIA_TASK_STATUSES = new Set(['succeeded', 'failed', 'cancelled']);
+
+const normalizeOptionalMediaModelId = (modelId: string | undefined): string | undefined => {
+  const canonicalModelId = canonicalizeMediaModelId(modelId);
+  return canonicalModelId || undefined;
+};
+
+const normalizeMediaSelectionState = (selection?: MediaSelectionState): MediaSelectionState | undefined => {
+  if (!selection) return undefined;
+  const normalized: MediaSelectionState = {
+    ...selection,
+    modelId: normalizeOptionalMediaModelId(selection.modelId),
+    imageModelId: normalizeOptionalMediaModelId(selection.imageModelId),
+    videoModelId: normalizeOptionalMediaModelId(selection.videoModelId),
+  };
+  const displayModelId = normalized.modelId || normalized.imageModelId || normalized.videoModelId;
+  if (displayModelId) {
+    normalized.modelName = mediaModelDisplayName(displayModelId, selection.modelName);
+  }
+  return normalized;
+};
+
+const mediaModelIdForOutput = (model: unknown, fallback?: string): string => {
+  const rawModel = typeof model === 'string' && model.trim() ? model : fallback;
+  return mediaModelDisplayName(rawModel, rawModel) || 'default';
+};
+
 type MediaStatusPollUpdate = {
   sessionId: string;
   toolCallId: string;
@@ -3219,12 +3296,12 @@ if (!gotTheLock) {
     const action = (args.action as string) || 'generate';
     const serverBaseUrl = getServerApiBaseUrl();
     const sessionId = extractSessionIdFromKey(request.context.sessionKey);
-    const selection = sessionId ? mediaSelectionBySession.get(sessionId) : undefined;
+    const selection = normalizeMediaSelectionState(sessionId ? mediaSelectionBySession.get(sessionId) : undefined);
     const prompt = typeof args.prompt === 'string' ? args.prompt : '';
-    const explicitModel = typeof args.model === 'string' ? args.model.trim() : '';
+    const explicitModel = canonicalizeMediaModelId(typeof args.model === 'string' ? args.model : '');
     const resolvedModelFromSelection = tool === MediaGenerationTool.Image
-      ? (selection?.imageModelId || selection?.modelId || '')
-      : (selection?.videoModelId || selection?.modelId || '');
+      ? canonicalizeMediaModelId(selection?.imageModelId || selection?.modelId || '')
+      : canonicalizeMediaModelId(selection?.videoModelId || selection?.modelId || '');
     let selectedModel = explicitModel || resolvedModelFromSelection;
     let selectedModelSource = explicitModel ? 'tool' : resolvedModelFromSelection ? 'selection' : 'none';
 
@@ -3274,7 +3351,15 @@ if (!gotTheLock) {
           console.warn('[MediaGeneration] server rejected model list request:', serializeForLog({ mediaType, code: body.code, message: body.message }));
           return { content: [{ type: 'text', text: body.message || 'Failed to list models.' }], isError: true };
         }
-        const models = body.data || [];
+        const models = (body.data || []).map(model => {
+          const mediaModel = model as { modelId?: string; displayName?: string };
+          const modelId = canonicalizeMediaModelId(mediaModel.modelId);
+          return {
+            ...(model as Record<string, unknown>),
+            modelId,
+            displayName: mediaModelDisplayName(modelId, mediaModel.displayName),
+          };
+        });
         console.log(`[MediaGeneration] server returned ${models.length} ${mediaType} models.`);
         let text = models.length > 0
           ? `Available ${mediaType} models:\n\n${(models as Array<{ modelId: string; displayName: string; capabilities?: string; parameterSpec?: Record<string, unknown> }>).map(m => {
@@ -3319,7 +3404,7 @@ if (!gotTheLock) {
         const assets = resultUrls.map(url => ({
           type: statusMediaType,
           url,
-          mimeType: statusMediaType === 'image' ? 'image/png' : 'video/mp4',
+          mimeType: resolveGeneratedMediaAssetMimeType(statusMediaType, url),
         }));
 
         let resultLines: string[];
@@ -3362,7 +3447,7 @@ if (!gotTheLock) {
           ...(task.upstreamTaskId ? { upstreamTaskId: String(task.upstreamTaskId) } : {}),
           status,
           ...(pollCount > 1 ? { pollCount } : {}),
-          model: task.model as string,
+          model: mediaModelIdForOutput(task.model),
           mediaType: statusMediaType,
           ...(detailsAssets.length > 0 ? { assets: detailsAssets } : {}),
           ...(task.quotaRemaining != null ? { billing: { quotaRemaining: task.quotaRemaining } } : {}),
@@ -3465,6 +3550,14 @@ if (!gotTheLock) {
       if (args.aspectRatio) params.aspectRatio = args.aspectRatio;
       if (args.resolution) params.resolution = args.resolution;
       if (args.size) params.size = args.size;
+      if (mediaType === 'image') {
+        if (args.n != null) params.n = args.n;
+        if (args.quality) params.quality = args.quality;
+        if (args.outputFormat) params.outputFormat = args.outputFormat;
+        if (args.output_format) params.output_format = args.output_format;
+        if (args.temperature != null) params.temperature = args.temperature;
+        if (args.imageSize) params.imageSize = args.imageSize;
+      }
       if (args.count) params.count = args.count;
       if (args.durationSeconds != null) params.durationSeconds = args.durationSeconds;
       if (args.audio != null) params.audio = args.audio;
@@ -3628,18 +3721,19 @@ if (!gotTheLock) {
       const task = body.data!;
       const status = task.status as string;
       const resultUrls = (task.resultUrls as string[]) || [];
+      const outputModel = mediaModelIdForOutput(task.model, selectedModel);
       console.log('[MediaGeneration] server accepted generate request:', serializeForLog({
         mediaType,
         taskId: task.taskId,
         status,
-        model: task.model || selectedModel,
+        model: outputModel,
         resultCount: resultUrls.length,
         quotaRemaining: task.quotaRemaining,
       }));
       const assets = resultUrls.map(url => ({
         type: mediaType,
         url,
-        mimeType: mediaType === 'image' ? 'image/png' : 'video/mp4',
+        mimeType: resolveGeneratedMediaAssetMimeType(mediaType, url),
         ...(args.filename ? { filename: args.filename as string } : {}),
       }));
       let detailsAssets: unknown[] = assets;
@@ -3648,6 +3742,7 @@ if (!gotTheLock) {
       if (task.quotaRemaining != null) billing.quotaRemaining = task.quotaRemaining;
       if (mediaType === 'image') {
         if (args.count) billing.frozenImages = args.count;
+        else if (args.n) billing.frozenImages = args.n;
       } else {
         if (args.durationSeconds) billing.frozenVideoSeconds = args.durationSeconds;
       }
@@ -3655,7 +3750,7 @@ if (!gotTheLock) {
       const lines = [
         `${mediaType === 'image' ? 'Image' : 'Video'} generation task created.`,
         `Task ID: ${task.upstreamTaskId || task.taskId}`,
-        `Model: ${task.model || selectedModel || 'default'}`,
+        `Model: ${outputModel}`,
         `Status: ${status}`,
         ...(task.quotaRemaining != null ? [`Quota remaining: ${task.quotaRemaining}`] : []),
       ];
@@ -3701,7 +3796,7 @@ if (!gotTheLock) {
             taskId: String(task.taskId),
             sessionId,
             mediaType,
-            model: (task.model as string) || selectedModel,
+            model: outputModel,
             startedAt: Date.now(),
             pollCount: 0,
             timeoutMs,
@@ -3715,7 +3810,7 @@ if (!gotTheLock) {
           taskId: String(task.taskId),
           ...(task.upstreamTaskId ? { upstreamTaskId: String(task.upstreamTaskId) } : {}),
           status,
-          model: (task.model as string) || selectedModel,
+          model: outputModel,
           ...(detailsAssets.length > 0 ? { assets: detailsAssets } : {}),
           ...(Object.keys(billing).length > 0 ? { billing } : {}),
         },
@@ -3810,7 +3905,7 @@ if (!gotTheLock) {
           const assets = resultUrls.map(url => ({
             type: tracker.mediaType,
             url,
-            mimeType: tracker.mediaType === 'image' ? 'image/png' : 'video/mp4',
+            mimeType: resolveGeneratedMediaAssetMimeType(tracker.mediaType, url),
           }));
           if (status === 'succeeded' && tracker.mediaType === 'image') {
             const persistResult = await persistGeneratedImages(tracker.sessionId, assets);
@@ -4230,6 +4325,47 @@ if (!gotTheLock) {
     return tokens?.accessToken || null;
   });
 
+  ipcMain.handle(AuthIpcChannel.GetPricingCatalog, async () => {
+    try {
+      const serverBaseUrl = getServerApiBaseUrl();
+      const url = `${serverBaseUrl}/api/models/pricing-catalog`;
+      console.log(`[Auth:getPricingCatalog] requesting public pricing catalog at ${url}`);
+      const resp = await net.fetch(url, {
+        method: 'GET',
+        headers: { Accept: 'application/json' },
+      });
+      console.log(`[Auth:getPricingCatalog] server returned HTTP ${resp.status}.`);
+      if (!resp.ok) {
+        return { success: false, error: `HTTP ${resp.status}` };
+      }
+      const body = await resp.json() as {
+        code: number;
+        message?: string;
+        data?: {
+          textModels?: unknown[];
+          imageModels?: unknown[];
+          videoModels?: unknown[];
+        };
+      };
+      if (body.code !== 0) {
+        console.warn('[Auth:getPricingCatalog] server rejected pricing catalog request:', serializeForLog({
+          code: body.code,
+          message: body.message,
+        }));
+        return { success: false, error: body.message || 'Failed to load pricing catalog.' };
+      }
+      const textModels = Array.isArray(body.data?.textModels) ? body.data.textModels : [];
+      console.log(`[Auth:getPricingCatalog] loaded ${textModels.length} public text models.`);
+      return { success: true, textModels };
+    } catch (error) {
+      console.error('[Auth:getPricingCatalog] pricing catalog request failed:', error);
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Unknown error',
+      };
+    }
+  });
+
   ipcMain.handle('auth:getModels', async () => {
     try {
       const tokens = getAuthTokens();
@@ -4482,7 +4618,16 @@ if (!gotTheLock) {
       if (!resp.ok) return { success: false, error: `HTTP ${resp.status}` };
       const body = await resp.json() as { code: number; data?: unknown[]; message?: string };
       if (body.code !== 0) return { success: false, error: body.message };
-      return { success: true, models: body.data || [] };
+      const models = (body.data || []).map(model => {
+        const mediaModel = model as { modelId?: string; displayName?: string };
+        const modelId = canonicalizeMediaModelId(mediaModel.modelId);
+        return {
+          ...(model as Record<string, unknown>),
+          modelId,
+          displayName: mediaModelDisplayName(modelId, mediaModel.displayName),
+        };
+      });
+      return { success: true, models };
     } catch (e) {
       console.error('[Media:getModels] Error:', e);
       return { success: false, error: e instanceof Error ? e.message : 'Unknown error' };
@@ -4524,7 +4669,7 @@ if (!gotTheLock) {
     getSkillManager,
   });
 
-  ipcMain.handle('openclaw:engine:getStatus', async () => {
+  ipcMain.handle(OpenClawEngineIpc.GetStatus, async () => {
     try {
       const manager = getOpenClawEngineManager();
       return {
@@ -4539,7 +4684,7 @@ if (!gotTheLock) {
     }
   });
 
-  ipcMain.handle('openclaw:engine:install', async () => {
+  ipcMain.handle(OpenClawEngineIpc.Install, async () => {
     try {
       const status = await bootstrapOpenClawEngine({
         forceReinstall: false,
@@ -4559,7 +4704,7 @@ if (!gotTheLock) {
     }
   });
 
-  ipcMain.handle('openclaw:engine:retryInstall', async () => {
+  ipcMain.handle(OpenClawEngineIpc.RetryInstall, async () => {
     try {
       const status = await bootstrapOpenClawEngine({
         forceReinstall: true,
@@ -4580,13 +4725,13 @@ if (!gotTheLock) {
   });
 
   let restartGatewayPromise: Promise<OpenClawEngineStatus> | null = null;
-  ipcMain.handle('openclaw:engine:restartGateway', async () => {
+  ipcMain.handle(OpenClawEngineIpc.RestartGateway, async () => {
     console.log(
-      `${gwDiagTs()} IPC openclaw:engine:restartGateway: manual restart requested from renderer`,
+      `${gwDiagTs()} IPC ${OpenClawEngineIpc.RestartGateway}: manual restart requested from renderer`,
     );
     if (restartGatewayPromise) {
       console.log(
-        `${gwDiagTs()} IPC openclaw:engine:restartGateway: restart already in progress, joining existing promise`,
+        `${gwDiagTs()} IPC ${OpenClawEngineIpc.RestartGateway}: restart already in progress, joining existing promise`,
       );
       const status = await restartGatewayPromise;
       return { success: status.phase === 'running' || status.phase === 'ready', status };
@@ -4608,6 +4753,20 @@ if (!gotTheLock) {
       };
     } finally {
       restartGatewayPromise = null;
+    }
+  });
+
+  ipcMain.handle(OpenClawEngineIpc.RepairGatewayState, async () => {
+    try {
+      return await repairOpenClawGatewayState();
+    } catch (error) {
+      const manager = getOpenClawEngineManager();
+      return {
+        success: false,
+        status: manager.getStatus(),
+        originalPath: manager.getConfigPath(),
+        error: error instanceof Error ? error.message : 'Failed to repair OpenClaw gateway state',
+      };
     }
   });
 
@@ -4883,8 +5042,9 @@ if (!gotTheLock) {
           );
         }
 
-        if (options.mediaSelection && options.mediaSelection.mode !== 'none') {
-          mediaSelectionBySession.set(session.id, options.mediaSelection);
+        const normalizedMediaSelection = normalizeMediaSelectionState(options.mediaSelection);
+        if (normalizedMediaSelection && normalizedMediaSelection.mode !== 'none') {
+          mediaSelectionBySession.set(session.id, normalizedMediaSelection);
         } else {
           mediaSelectionBySession.delete(session.id);
         }
@@ -4941,7 +5101,7 @@ if (!gotTheLock) {
             confirmationMode: 'modal',
             imageAttachments: options.imageAttachments,
             agentId: options.agentId,
-            mediaSelection: options.mediaSelection,
+            mediaSelection: normalizedMediaSelection,
             mediaReferences: options.mediaReferences,
             selectedTextSnippets,
           })
@@ -5036,8 +5196,9 @@ if (!gotTheLock) {
           };
         }
 
-        if (options.mediaSelection && options.mediaSelection.mode !== 'none') {
-          mediaSelectionBySession.set(options.sessionId, options.mediaSelection);
+        const normalizedMediaSelection = normalizeMediaSelectionState(options.mediaSelection);
+        if (normalizedMediaSelection && normalizedMediaSelection.mode !== 'none') {
+          mediaSelectionBySession.set(options.sessionId, normalizedMediaSelection);
         } else {
           mediaSelectionBySession.delete(options.sessionId);
         }
@@ -5076,7 +5237,7 @@ if (!gotTheLock) {
             kitReferences: options.kitReferences,
             resolvedKitCapabilities: options.resolvedKitCapabilities,
             imageAttachments: options.imageAttachments,
-            mediaSelection: options.mediaSelection,
+            mediaSelection: normalizedMediaSelection,
             mediaReferences: options.mediaReferences,
             selectedTextSnippets,
           })
@@ -6302,53 +6463,7 @@ if (!gotTheLock) {
     pollNimQrLogin,
   });
 
-  // ==================== Permissions IPC Handlers ====================
-
-  ipcMain.handle('permissions:checkCalendar', async () => {
-    try {
-      const status = await checkCalendarPermission();
-
-      // Development mode: Auto-request permission if not determined
-      // This provides a better dev experience without affecting production
-      if (isDev && status === 'not-determined' && process.platform === 'darwin') {
-        console.log('[Permissions] Development mode: Auto-requesting calendar permission...');
-        try {
-          await requestCalendarPermission();
-          const newStatus = await checkCalendarPermission();
-          console.log(
-            '[Permissions] Development mode: Permission status after request:',
-            newStatus,
-          );
-          return { success: true, status: newStatus, autoRequested: true };
-        } catch (requestError) {
-          console.warn('[Permissions] Development mode: Auto-request failed:', requestError);
-        }
-      }
-
-      return { success: true, status };
-    } catch (error) {
-      console.error('[Main] Error checking calendar permission:', error);
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : 'Failed to check permission',
-      };
-    }
-  });
-
-  ipcMain.handle('permissions:requestCalendar', async () => {
-    try {
-      // Request permission and check status
-      const granted = await requestCalendarPermission();
-      const status = await checkCalendarPermission();
-      return { success: true, granted, status };
-    } catch (error) {
-      console.error('[Main] Error requesting calendar permission:', error);
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : 'Failed to request permission',
-      };
-    }
-  });
+  registerPermissionIpcHandlers({ ipcMain, isDev });
 
   // ==================== IM Gateway IPC Handlers ====================
 
@@ -7981,6 +8096,15 @@ if (!gotTheLock) {
     }
   });
 
+  ipcMain.handle(ClipboardIpc.WriteText, async (_event, text: string) => {
+    try {
+      clipboard.writeText(text);
+      return { success: true };
+    } catch (error) {
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  });
+
   ipcMain.handle(ClipboardIpc.WriteImageFromFile, async (_event, filePath: string) => {
     try {
       const image = nativeImage.createFromPath(filePath);
@@ -8007,116 +8131,10 @@ if (!gotTheLock) {
     }
   });
 
-  // ---- artifact file watching ----
-
-  // Voice dictation - trigger OS-level speech-to-text
-  ipcMain.handle('voice:triggerDictation', async () => {
-    try {
-      console.log(`[Voice] Dictation shortcut requested on ${process.platform}`);
-      if (process.platform === 'win32') {
-        const { exec } = require('child_process');
-        const { promisify } = require('util');
-        const execAsync = promisify(exec);
-        // Simulate Win+H via keybd_event P/Invoke
-        await execAsync(
-          `powershell -NoProfile -Command "Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class KS{[DllImport(\\\"user32.dll\\\")]public static extern void keybd_event(byte k,byte s,uint f,int e);public static void WinH(){keybd_event(0x5B,0,0,0);keybd_event(0x48,0,0,0);keybd_event(0x48,0,2,0);keybd_event(0x5B,0,2,0);}}'; [KS]::WinH()"`,
-          { timeout: 5000 },
-        );
-        console.log('[Voice] Windows dictation shortcut sent successfully');
-        return { success: true };
-      } else if (process.platform === 'darwin') {
-        if (!systemPreferences.isTrustedAccessibilityClient(false)) {
-          console.warn('[Voice] macOS Accessibility permission is missing, requesting permission');
-          systemPreferences.isTrustedAccessibilityClient(true);
-          return { success: false, error: 'permission_denied' };
-        }
-
-        // macOS: prefer the system Edit > Start Dictation menu item; keyboard events are less reliable.
-        const { exec } = require('child_process');
-        const { promisify } = require('util');
-        const execAsync = promisify(exec);
-        try {
-          await execAsync(
-            `osascript -e 'tell application "System Events"
-  set frontProcess to first application process whose frontmost is true
-  tell frontProcess
-    set editMenu to missing value
-    repeat with menuBarItem in menu bar items of menu bar 1
-      set itemName to name of menuBarItem
-      if itemName is "Edit" or itemName is "编辑" then
-        set editMenu to menu 1 of menuBarItem
-        exit repeat
-      end if
-    end repeat
-    if editMenu is missing value then error "Edit menu not found"
-    set dictationItem to missing value
-    repeat with menuItem in menu items of editMenu
-      set itemName to name of menuItem
-      if itemName contains "Dictation" or itemName contains "听写" then
-        set dictationItem to menuItem
-        exit repeat
-      end if
-    end repeat
-    if dictationItem is missing value then error "Dictation menu item not found"
-    click dictationItem
-  end tell
-end tell'`,
-            { timeout: 5000 },
-          );
-          console.log('[Voice] macOS dictation menu item clicked successfully');
-          return { success: true };
-        } catch (menuError: unknown) {
-          console.warn(
-            '[Voice] macOS dictation menu item failed, falling back to keyboard shortcut:',
-            menuError,
-          );
-        }
-
-        try {
-          await execAsync(`osascript -e 'tell application "System Events" to key code 96'`, {
-            timeout: 5000,
-          });
-          console.log('[Voice] macOS dictation key shortcut sent successfully');
-          return { success: true };
-        } catch (dictationKeyError: unknown) {
-          console.warn(
-            '[Voice] macOS dictation key shortcut failed, falling back to Fn shortcut:',
-            dictationKeyError,
-          );
-        }
-
-        try {
-          await execAsync(
-            `osascript -e 'tell application "System Events" to key code 63' -e 'delay 0.05' -e 'tell application "System Events" to key code 63'`,
-            { timeout: 5000 },
-          );
-          console.log('[Voice] macOS Fn dictation shortcut sent successfully');
-          return { success: true };
-        } catch (darwinError: unknown) {
-          const stderr =
-            typeof darwinError === 'object' && darwinError && 'stderr' in darwinError
-              ? String((darwinError as { stderr?: unknown }).stderr ?? '')
-              : '';
-          const message = darwinError instanceof Error ? darwinError.message : String(darwinError);
-          const lowerErrorText = `${stderr}\n${message}`.toLowerCase();
-          if (
-            lowerErrorText.includes('not allowed assistive access') ||
-            lowerErrorText.includes('assistive') ||
-            lowerErrorText.includes('not authorized') ||
-            lowerErrorText.includes('1002')
-          ) {
-            return { success: false, error: 'permission_denied' };
-          }
-          console.warn('[Voice] macOS dictation shortcut failed:', darwinError);
-          return { success: false, error: message || 'Unknown error' };
-        }
-      }
-      console.warn(`[Voice] Dictation shortcut is unsupported on ${process.platform}`);
-      return { success: false, error: 'Unsupported platform' };
-    } catch (error) {
-      console.warn('[Voice] Dictation shortcut failed:', error);
-      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
-    }
+  registerAsrIpcHandlers({
+    getAuthTokens,
+    fetchWithAuth,
+    getServerApiBaseUrl,
   });
 
   // ---- artifact file watching ----
@@ -8710,7 +8728,7 @@ end tell'`,
       windowStatePersist.emitState();
       if (openClawEngineManager && !mainWindow?.isDestroyed()) {
         mainWindow.webContents.send(
-          'openclaw:engine:onProgress',
+          OpenClawEngineIpc.OnProgress,
           openClawEngineManager.getStatus(),
         );
       }
@@ -9289,6 +9307,12 @@ end tell'`,
     // sees the loading UI within ~1-2 s instead of waiting for the full
     // skill bootstrap (~6-8 s previously).
     setContentSecurityPolicy();
+    registerVoiceInputPermissionHandler({
+      session: session.defaultSession,
+      getMainWindow: () => mainWindow,
+      isDev,
+      startUrl: process.env.ELECTRON_START_URL,
+    });
 
     profiler.mark('createWindow');
     console.log('[Main] initApp: creating window');

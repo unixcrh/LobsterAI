@@ -1,6 +1,7 @@
 import { FolderIcon } from '@heroicons/react/24/outline';
 import React, { useEffect, useMemo, useRef } from 'react';
 
+import { classifyErrorKey } from '../../../common/coworkErrorClassify';
 import { ContextCompactionStatus } from '../../../common/coworkSystemMessages';
 import { getScheduledReminderDisplayText } from '../../../scheduledTask/reminderText';
 import { i18nService } from '../../services/i18n';
@@ -10,6 +11,7 @@ import { revealLocalPathWithToast } from '../../utils/localFileActions';
 import { ArtifactPreviewCard } from '../artifacts';
 import ExclamationTriangleIcon from '../icons/ExclamationTriangleIcon';
 import InformationCircleIcon from '../icons/InformationCircleIcon';
+import MarkdownContent from '../MarkdownContent';
 import AssistantMessageItem from './AssistantMessageItem';
 import MediaPollingIndicator from './MediaPollingIndicator';
 import {
@@ -97,6 +99,14 @@ const TypingDots: React.FC = () => (
   </div>
 );
 
+const getSystemMessageDisplayContent = (message: CoworkMessage, content: string): string => {
+  const errorText = typeof message.metadata?.error === 'string' ? message.metadata.error : null;
+  if (!errorText) return content;
+
+  const key = classifyErrorKey(errorText) ?? classifyErrorKey(content);
+  return key ? i18nService.t(key) : content;
+};
+
 // ── VideoArtifactPathList ────────────────────────────────────────────────────
 
 const VideoArtifactPathList: React.FC<{ artifacts: Artifact[] }> = ({ artifacts }) => {
@@ -160,6 +170,7 @@ const AssistantTurnBlock: React.FC<{
   resolveLocalFilePath?: (href: string, text: string) => string | null;
   mapDisplayText?: (value: string) => string;
   onOpenLocalService?: (artifact: Artifact) => void;
+  onOpenHtmlFile?: (artifact: Artifact) => void;
   onForkMessage?: (messageId: string) => void;
   showTypingIndicator?: boolean;
   showCopyButtons?: boolean;
@@ -169,6 +180,7 @@ const AssistantTurnBlock: React.FC<{
   resolveLocalFilePath,
   mapDisplayText,
   onOpenLocalService,
+  onOpenHtmlFile,
   onForkMessage,
   showTypingIndicator = false,
   showCopyButtons = true,
@@ -208,7 +220,8 @@ const AssistantTurnBlock: React.FC<{
       return null;
     }
     const normalizedContent = getScheduledReminderDisplayText(rawContent) ?? rawContent;
-    const content = mapDisplayText ? mapDisplayText(normalizedContent) : normalizedContent;
+    const displayContent = getSystemMessageDisplayContent(message, normalizedContent);
+    const content = mapDisplayText ? mapDisplayText(displayContent) : displayContent;
     if (!content.trim() && !isContextCompactionMessage(message)) return null;
 
     if (isContextCompactionMessage(message)) {
@@ -228,8 +241,11 @@ const AssistantTurnBlock: React.FC<{
             ? <ExclamationTriangleIcon className="h-4 w-4 text-secondary flex-shrink-0" />
             : <InformationCircleIcon className="h-4 w-4 text-secondary flex-shrink-0" />
           }
-          <div className="text-xs whitespace-pre-wrap text-secondary">
-            {content}
+          <div className="min-w-0 text-xs text-secondary">
+            <MarkdownContent
+              content={content}
+              className="!text-xs !leading-5 [&_a]:!text-primary [&_p]:!my-0 [&_p]:!text-secondary [&_p]:!leading-5"
+            />
           </div>
         </div>
       </div>
@@ -398,6 +414,7 @@ const AssistantTurnBlock: React.FC<{
                       key={artifact.id}
                       artifact={artifact}
                       onOpenLocalService={onOpenLocalService}
+                      onOpenHtmlFile={onOpenHtmlFile}
                     />
                   ))}
                 </div>

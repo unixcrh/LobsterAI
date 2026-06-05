@@ -1,9 +1,9 @@
 import { ProviderName } from '@shared/providers';
 import { afterEach, describe, expect, test, vi } from 'vitest';
 
-import { type AppConfig, CONFIG_KEYS, defaultConfig } from '../config';
+import { type AppConfig, CONFIG_KEYS, defaultConfig, ShortcutAction } from '../config';
 
-const makeLegacyConfigWithoutMiniMaxM3 = (): AppConfig => ({
+const makeLegacyConfigWithoutMiniMaxAddedModels = (): AppConfig => ({
   ...defaultConfig,
   providers: {
     ...defaultConfig.providers,
@@ -12,7 +12,7 @@ const makeLegacyConfigWithoutMiniMaxM3 = (): AppConfig => ({
       enabled: true,
       apiKey: 'sk-minimax',
       models: defaultConfig.providers![ProviderName.Minimax].models?.filter(
-        model => model.id !== 'MiniMax-M3'
+        model => model.id !== 'MiniMax-M3' && model.id !== 'MiniMax-M2.7'
       ),
     },
   },
@@ -83,6 +83,40 @@ const makeConfigWithCustomContextWindows = (): AppConfig => ({
   },
 });
 
+const makeConfigWithDeletedProviderModel = (
+  providerName: ProviderName,
+  deletedModelId: string,
+): AppConfig => ({
+  ...defaultConfig,
+  providerModelMigrationVersions: {
+    [providerName]: 1,
+  },
+  providers: {
+    ...defaultConfig.providers,
+    [providerName]: {
+      ...defaultConfig.providers![providerName],
+      enabled: true,
+      apiKey: `sk-${providerName}`,
+      models: defaultConfig.providers![providerName].models?.filter(
+        model => model.id !== deletedModelId
+      ),
+    },
+  },
+});
+
+const addedProviderMigrationCases: Array<{ providerName: ProviderName; deletedModelId: string }> = [
+  { providerName: ProviderName.DeepSeek, deletedModelId: 'deepseek-v4-flash' },
+  { providerName: ProviderName.Moonshot, deletedModelId: 'kimi-k2.6' },
+  { providerName: ProviderName.Minimax, deletedModelId: 'MiniMax-M3' },
+  { providerName: ProviderName.Zhipu, deletedModelId: 'glm-5.1' },
+  { providerName: ProviderName.Qianfan, deletedModelId: 'kimi-k2.5' },
+  { providerName: ProviderName.Xiaomi, deletedModelId: 'mimo-v2.5-pro' },
+  { providerName: ProviderName.OpenAI, deletedModelId: 'gpt-5.4' },
+  { providerName: ProviderName.Gemini, deletedModelId: 'gemini-3.1-flash-lite' },
+  { providerName: ProviderName.Anthropic, deletedModelId: 'claude-opus-4-7' },
+  { providerName: ProviderName.OpenRouter, deletedModelId: 'anthropic/claude-sonnet-4.6' },
+];
+
 async function loadConfigServiceWithStoredConfig(storedConfig: AppConfig) {
   vi.resetModules();
   const storeData: Record<string, unknown> = {
@@ -116,10 +150,59 @@ afterEach(() => {
   delete (globalThis as { window?: unknown }).window;
 });
 
+describe('configService shortcut migrations', () => {
+  test('normalizes prior agent default shortcuts to unset', async () => {
+    const storedConfig: AppConfig = {
+      ...defaultConfig,
+      shortcuts: {
+        ...defaultConfig.shortcuts!,
+        [ShortcutAction.PreviousAgent]: 'CommandOrControl+Shift+[',
+        [ShortcutAction.NextAgent]: 'CommandOrControl+Shift+]',
+        [ShortcutAction.ShowCurrentAgentTasks]: 'CommandOrControl+Shift+H',
+        [ShortcutAction.OpenAgentTask1]: 'CommandOrControl+Shift+1',
+        [ShortcutAction.OpenAgentTask2]: 'CommandOrControl+Shift+2',
+        [ShortcutAction.OpenAgentTask3]: 'CommandOrControl+Shift+3',
+        [ShortcutAction.OpenAgentTask4]: 'CommandOrControl+Shift+4',
+        [ShortcutAction.OpenAgentTask5]: 'CommandOrControl+Shift+5',
+        [ShortcutAction.OpenAgentTask6]: 'CommandOrControl+Shift+6',
+        [ShortcutAction.OpenAgentTask7]: 'CommandOrControl+Shift+7',
+        [ShortcutAction.OpenAgentTask8]: 'CommandOrControl+Shift+8',
+        [ShortcutAction.OpenAgentTask9]: 'CommandOrControl+Shift+9',
+      },
+    };
+    const { configService, storeData } = await loadConfigServiceWithStoredConfig(storedConfig);
+
+    await configService.init();
+
+    const savedConfig = storeData[CONFIG_KEYS.APP_CONFIG] as AppConfig;
+    expect(configService.getConfig().shortcuts?.[ShortcutAction.PreviousAgent]).toBe('');
+    expect(configService.getConfig().shortcuts?.[ShortcutAction.NextAgent]).toBe('');
+    expect(configService.getConfig().shortcuts?.[ShortcutAction.ShowCurrentAgentTasks]).toBe('');
+    expect(configService.getConfig().shortcuts?.[ShortcutAction.OpenAgentTask1]).toBe('');
+    expect(configService.getConfig().shortcuts?.[ShortcutAction.OpenAgentTask9]).toBe('');
+    expect(savedConfig.shortcuts?.[ShortcutAction.PreviousAgent]).toBe('');
+  });
+
+  test('preserves customized agent shortcuts during normalization', async () => {
+    const storedConfig: AppConfig = {
+      ...defaultConfig,
+      shortcuts: {
+        ...defaultConfig.shortcuts!,
+        [ShortcutAction.PreviousAgent]: 'CommandOrControl+Alt+Left',
+      },
+    };
+    const { configService } = await loadConfigServiceWithStoredConfig(storedConfig);
+
+    await configService.init();
+
+    expect(configService.getConfig().shortcuts?.[ShortcutAction.PreviousAgent]).toBe('CommandOrControl+Alt+Left');
+  });
+});
+
 describe('configService provider migrations', () => {
   test('persists injected provider models during init', async () => {
     const { configService, storeData, setItem } = await loadConfigServiceWithStoredConfig(
-      makeLegacyConfigWithoutMiniMaxM3()
+      makeLegacyConfigWithoutMiniMaxAddedModels()
     );
 
     await configService.init();
@@ -133,7 +216,7 @@ describe('configService provider migrations', () => {
   });
 
   test('preserves injected provider models when saving partial config updates', async () => {
-    const legacyConfig = makeLegacyConfigWithoutMiniMaxM3();
+    const legacyConfig = makeLegacyConfigWithoutMiniMaxAddedModels();
     const { configService, storeData } = await loadConfigServiceWithStoredConfig(legacyConfig);
 
     await configService.updateConfig({
@@ -206,5 +289,103 @@ describe('configService provider migrations', () => {
     expect(savedConfig.providers?.[ProviderName.DeepSeek].models?.find(model => model.id === 'deepseek-v4-pro')?.contextWindow).toBe(384_000);
     expect(savedConfig.providers?.[ProviderName.Xiaomi].models?.find(model => model.id === 'mimo-v2.5-pro')?.contextWindow).toBe(640_000);
     expect(savedConfig.providers?.[ProviderName.Xiaomi].models?.find(model => model.id === 'mimo-v2.5')?.contextWindow).toBe(768_000);
+  });
+
+  test.each(addedProviderMigrationCases)(
+    'does not re-inject a deleted $providerName model after migration is applied',
+    async ({ providerName, deletedModelId }) => {
+      const { configService, storeData } = await loadConfigServiceWithStoredConfig(
+        makeConfigWithDeletedProviderModel(providerName, deletedModelId)
+      );
+
+      await configService.init();
+
+      const savedConfig = storeData[CONFIG_KEYS.APP_CONFIG] as AppConfig;
+      expect(savedConfig.providers?.[providerName].models?.map(model => model.id)).not.toContain(deletedModelId);
+    }
+  );
+
+  test('treats a provider with any migrated model as already migrated', async () => {
+    const deletedModelId = 'kimi-k2.5';
+    const storedConfig: AppConfig = {
+      ...defaultConfig,
+      providerModelMigrationVersions: undefined,
+      providers: {
+        ...defaultConfig.providers,
+        [ProviderName.Qianfan]: {
+          ...defaultConfig.providers![ProviderName.Qianfan],
+          enabled: true,
+          apiKey: 'sk-qianfan',
+          models: defaultConfig.providers![ProviderName.Qianfan].models?.filter(
+            model => model.id !== deletedModelId
+          ),
+        },
+      },
+    };
+    const { configService, storeData } = await loadConfigServiceWithStoredConfig(storedConfig);
+
+    await configService.init();
+
+    const savedConfig = storeData[CONFIG_KEYS.APP_CONFIG] as AppConfig;
+    expect(savedConfig.providerModelMigrationVersions?.[ProviderName.Qianfan]).toBe(1);
+    expect(savedConfig.providers?.[ProviderName.Qianfan].models?.map(model => model.id)).not.toContain(deletedModelId);
+  });
+
+  test('does not re-inject a deleted Xiaomi model after migration is applied', async () => {
+    const deletedModelId = 'mimo-v2.5-pro';
+    const legacyConfig = makeConfigWithDeletedProviderModel(ProviderName.Xiaomi, deletedModelId);
+    const { configService, storeData } = await loadConfigServiceWithStoredConfig(legacyConfig);
+
+    await configService.updateConfig({
+      model: {
+        ...legacyConfig.model,
+        defaultModel: 'mimo-v2.5',
+        defaultModelProvider: ProviderName.Xiaomi,
+      },
+    });
+
+    const savedConfig = storeData[CONFIG_KEYS.APP_CONFIG] as AppConfig;
+    expect(savedConfig.providers?.[ProviderName.Xiaomi].models?.map(model => model.id)).not.toContain(deletedModelId);
+    expect(savedConfig.model.defaultModel).toBe('mimo-v2.5');
+    expect(savedConfig.model.defaultModelProvider).toBe(ProviderName.Xiaomi);
+  });
+
+  test('marks provider model migrations when saving provider edits from default config', async () => {
+    vi.resetModules();
+    const storeData: Record<string, unknown> = {};
+    const getItem = vi.fn(async (key: string) => storeData[key] ?? null);
+    const setItem = vi.fn(async (key: string, value: unknown) => {
+      storeData[key] = value;
+    });
+
+    vi.doMock('./store', () => ({
+      localStore: {
+        getItem,
+        setItem,
+        removeItem: vi.fn(),
+      },
+    }));
+
+    (globalThis as unknown as { window?: unknown }).window = {
+      dispatchEvent: vi.fn(),
+    };
+
+    const { configService } = await import('./config');
+    const deletedModelId = 'kimi-k2.5';
+    await configService.updateConfig({
+      providers: {
+        ...defaultConfig.providers,
+        [ProviderName.Qianfan]: {
+          ...defaultConfig.providers![ProviderName.Qianfan],
+          models: defaultConfig.providers![ProviderName.Qianfan].models?.filter(
+            model => model.id !== deletedModelId
+          ),
+        },
+      },
+    });
+
+    const savedConfig = storeData[CONFIG_KEYS.APP_CONFIG] as AppConfig;
+    expect(savedConfig.providerModelMigrationVersions?.[ProviderName.Qianfan]).toBe(1);
+    expect(savedConfig.providers?.[ProviderName.Qianfan].models?.map(model => model.id)).not.toContain(deletedModelId);
   });
 });

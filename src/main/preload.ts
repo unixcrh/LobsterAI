@@ -4,6 +4,10 @@ import { IpcChannel as ScheduledTaskIpc } from '../scheduledTask/constants';
 import { AgentIpcChannel } from '../shared/agent/constants';
 import { AppUpdateIpc } from '../shared/appUpdate/constants';
 import { ArtifactPreviewIpc } from '../shared/artifactPreview/constants';
+import {
+  AsrIpcChannel,
+  type AsrRecognizeRequest,
+} from '../shared/asr/constants';
 import { AuthIpcChannel } from '../shared/auth/constants';
 import { BrowserIpc, type BrowserRuntimeProfile } from '../shared/browserWebAccess/constants';
 import { ClipboardIpc } from '../shared/clipboard/constants';
@@ -25,6 +29,8 @@ import {
   LocalWebServicesIpc,
 } from '../shared/localWebServices/constants';
 import { McpIpcChannel } from '../shared/mcp/constants';
+import { OpenClawEngineIpc } from '../shared/openclawEngine/constants';
+import { PermissionIpcChannel } from '../shared/permissions/constants';
 import type { Platform } from '../shared/platform';
 import { NimQrLoginIpc } from './ipcHandlers/nimQrLogin';
 import { OpenClawSessionIpc } from './openclawSession/constants';
@@ -97,8 +103,8 @@ contextBridge.exposeInMainWorld('electron', {
     listInstalled: () => ipcRenderer.invoke('kits:listInstalled'),
   },
   permissions: {
-    checkCalendar: () => ipcRenderer.invoke('permissions:checkCalendar'),
-    requestCalendar: () => ipcRenderer.invoke('permissions:requestCalendar'),
+    checkCalendar: () => ipcRenderer.invoke(PermissionIpcChannel.CheckCalendar),
+    requestCalendar: () => ipcRenderer.invoke(PermissionIpcChannel.RequestCalendar),
   },
   enterprise: {
     getConfig: () => ipcRenderer.invoke('enterprise:getConfig'),
@@ -198,14 +204,15 @@ contextBridge.exposeInMainWorld('electron', {
   getRecentCwds: (limit?: number) => ipcRenderer.invoke('get-recent-cwds', limit),
   openclaw: {
     engine: {
-      getStatus: () => ipcRenderer.invoke('openclaw:engine:getStatus'),
-      install: () => ipcRenderer.invoke('openclaw:engine:install'),
-      retryInstall: () => ipcRenderer.invoke('openclaw:engine:retryInstall'),
-      restartGateway: () => ipcRenderer.invoke('openclaw:engine:restartGateway'),
+      getStatus: () => ipcRenderer.invoke(OpenClawEngineIpc.GetStatus),
+      install: () => ipcRenderer.invoke(OpenClawEngineIpc.Install),
+      retryInstall: () => ipcRenderer.invoke(OpenClawEngineIpc.RetryInstall),
+      restartGateway: () => ipcRenderer.invoke(OpenClawEngineIpc.RestartGateway),
+      repairGatewayState: () => ipcRenderer.invoke(OpenClawEngineIpc.RepairGatewayState),
       onProgress: (callback: (status: any) => void) => {
         const handler = (_event: any, status: any) => callback(status);
-        ipcRenderer.on('openclaw:engine:onProgress', handler);
-        return () => ipcRenderer.removeListener('openclaw:engine:onProgress', handler);
+        ipcRenderer.on(OpenClawEngineIpc.OnProgress, handler);
+        return () => ipcRenderer.removeListener(OpenClawEngineIpc.OnProgress, handler);
       },
     },
     sessionPolicy: {
@@ -555,6 +562,8 @@ contextBridge.exposeInMainWorld('electron', {
       ipcRenderer.invoke('shell:openPathWithApp', filePath, appPath),
   },
   clipboard: {
+    writeText: (text: string) =>
+      ipcRenderer.invoke(ClipboardIpc.WriteText, text),
     writeImageFromFile: (filePath: string) =>
       ipcRenderer.invoke(ClipboardIpc.WriteImageFromFile, filePath),
     writeImageFromDataUrl: (dataUrl: string) =>
@@ -582,8 +591,9 @@ contextBridge.exposeInMainWorld('electron', {
     disable: (shareId: string) => ipcRenderer.invoke(HtmlShareIpc.Disable, shareId),
     get: (shareId: string) => ipcRenderer.invoke(HtmlShareIpc.Get, shareId),
   },
-  voice: {
-    triggerDictation: () => ipcRenderer.invoke('voice:triggerDictation'),
+  asr: {
+    recognize: (options: AsrRecognizeRequest) =>
+      ipcRenderer.invoke(AsrIpcChannel.Recognize, options),
   },
   artifact: {
     watchFile: (filePath: string) => ipcRenderer.invoke('artifact:watchFile', filePath),
@@ -882,6 +892,7 @@ contextBridge.exposeInMainWorld('electron', {
     refreshToken: () => ipcRenderer.invoke('auth:refreshToken'),
     getAccessToken: () => ipcRenderer.invoke('auth:getAccessToken'),
     getModels: () => ipcRenderer.invoke('auth:getModels'),
+    getPricingCatalog: () => ipcRenderer.invoke(AuthIpcChannel.GetPricingCatalog),
     getProfileSummary: () => ipcRenderer.invoke('auth:getProfileSummary'),
     getPendingCallback: () => ipcRenderer.invoke(AuthIpcChannel.GetPendingCallback),
     onCallback: (callback: (data: { code: string }) => void) => {
