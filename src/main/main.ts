@@ -132,6 +132,10 @@ import {
 import { AppUpdateCoordinator, INSTALLATION_UUID_KEY } from './libs/appUpdateCoordinator';
 import { AuthCallbackRouter } from './libs/authCallbackRouter';
 import {
+  appendLoginParams,
+  startAuthLocalCallback,
+} from './libs/authLocalCallbackServer';
+import {
   clearServerModelMetadata,
   getAllServerModelMetadata,
   getCurrentApiConfig,
@@ -4055,17 +4059,34 @@ if (!gotTheLock) {
   };
 
   ipcMain.handle('auth:login', async (_event, { loginUrl }: { loginUrl?: string } = {}) => {
+    const baseUrl = loginUrl || `${getServerApiBaseUrl()}/login`;
+    const fallbackUrl = appendLoginParams(baseUrl, { source: 'electron' });
+    let localCallback: Awaited<ReturnType<typeof startAuthLocalCallback>> | null = null;
+
     try {
-      const baseUrl = loginUrl || `${getServerApiBaseUrl()}/login`;
-      const finalUrl = `${baseUrl}?source=electron`;
+      localCallback = await startAuthLocalCallback({
+        onCode: code => authCallbackRouter.handleAuthCode(code),
+      });
+      const finalUrl = appendLoginParams(baseUrl, {
+        source: 'electron',
+        redirect_uri: localCallback.redirectUri,
+        state: localCallback.state,
+      });
       await shell.openExternal(finalUrl);
       return { success: true };
     } catch (error) {
-      console.error('[Auth] login failed:', error);
-      return {
-        success: false,
-        error: error instanceof Error ? error.message : 'Failed to open login',
-      };
+      await localCallback?.close();
+      console.warn('[Auth] local callback login failed, falling back to deep link login:', error);
+      try {
+        await shell.openExternal(fallbackUrl);
+        return { success: true };
+      } catch (fallbackError) {
+        console.error('[Auth] login failed:', fallbackError);
+        return {
+          success: false,
+          error: fallbackError instanceof Error ? fallbackError.message : 'Failed to open login',
+        };
+      }
     }
   });
 
@@ -4104,7 +4125,10 @@ if (!gotTheLock) {
       return { success: true, user: body.data.user, quota };
     } catch (error) {
       console.error('[Auth] exchange failed:', error);
-      return { success: false, error: error instanceof Error ? error.message : 'Exchange failed' };
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Exchange failed',
+      };
     }
   });
 
