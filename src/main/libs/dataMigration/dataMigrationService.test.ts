@@ -9,6 +9,7 @@ import { DB_FILENAME } from '../../appConstants';
 import {
   createMigrationArchiveSync,
   inspectMigrationArchiveSync,
+  performDataMigrationRestoreSync,
   performPendingDataMigrationRestoreSync,
   writePendingRestoreRequestSync,
 } from './dataMigrationService';
@@ -165,6 +166,29 @@ test('performPendingDataMigrationRestoreSync creates rollback and restores backu
   expect(fs.existsSync(result?.rollbackPath || '')).toBe(true);
   expect(fs.readFileSync(path.join(targetUserData, DB_FILENAME), 'utf8')).toBe('source-db');
   expect(fs.readFileSync(path.join(targetUserData, 'SKILLs', 'demo', 'SKILL.md'), 'utf8')).toBe('# Demo');
+});
+
+test('performDataMigrationRestoreSync restores backup data without a pending marker', () => {
+  const root = makeTempDir();
+  const sourceUserData = path.join(root, 'source', 'LobsterAI');
+  const targetUserData = path.join(root, 'target', 'LobsterAI');
+  const rollbackRoot = path.join(root, 'rollbacks');
+  const archivePath = path.join(root, 'source-backup.tar.gz');
+
+  writeFile(path.join(sourceUserData, DB_FILENAME), 'source-db');
+  writeFile(path.join(targetUserData, DB_FILENAME), 'target-db');
+
+  createMigrationArchiveSync({ userDataPath: sourceUserData, outputPath: archivePath });
+
+  const result = performDataMigrationRestoreSync({
+    userDataPath: targetUserData,
+    rollbackRootPath: rollbackRoot,
+    archivePath,
+    now: new Date('2026-06-08T01:02:03Z'),
+  });
+
+  expect(result?.status).toBe(DataMigrationRestoreStatus.Success);
+  expect(fs.readFileSync(path.join(targetUserData, DB_FILENAME), 'utf8')).toBe('source-db');
 });
 
 test('performPendingDataMigrationRestoreSync replaces data in place and preserves runtime locks', () => {

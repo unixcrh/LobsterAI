@@ -81,6 +81,10 @@ export interface PerformPendingDataMigrationRestoreInput {
   now?: Date;
 }
 
+export interface PerformDataMigrationRestoreInput extends PerformPendingDataMigrationRestoreInput {
+  archivePath: string;
+}
+
 const pad = (value: number, width = 2): string => String(value).padStart(width, '0');
 
 export const formatDataMigrationTimestamp = (date = new Date()): string => (
@@ -461,26 +465,17 @@ const restoreRollbackArchiveSync = (rollbackPath: string, userDataPath: string):
   }
 };
 
-export const performPendingDataMigrationRestoreSync = (
-  input: PerformPendingDataMigrationRestoreInput,
+export const performDataMigrationRestoreSync = (
+  input: PerformDataMigrationRestoreInput,
 ): DataMigrationLastRestoreResult | null => {
-  const pendingPath = getPendingRestoreRequestPath(input.userDataPath);
-  const request = readJsonFileSync<PendingDataMigrationRestoreRequest>(pendingPath);
-  if (!request?.archivePath) return null;
-
   const now = input.now ?? new Date();
+  const archivePath = resolvePath(input.archivePath);
   let rollbackPath: string | undefined;
   let rollbackReady = false;
   let extractedTempRoot: string | null = null;
   let targetWasTouched = false;
 
   try {
-    try {
-      fs.unlinkSync(pendingPath);
-    } catch {
-      // The request has already been read; continue.
-    }
-
     ensureDirSync(input.rollbackRootPath);
     if (fs.existsSync(input.userDataPath)) {
       rollbackPath = path.join(input.rollbackRootPath, buildDataMigrationRollbackFileName(now));
@@ -493,7 +488,7 @@ export const performPendingDataMigrationRestoreSync = (
       rollbackReady = true;
     }
 
-    const extracted = extractMigrationArchiveToTempSync(request.archivePath);
+    const extracted = extractMigrationArchiveToTempSync(archivePath);
     extractedTempRoot = extracted.tempRoot;
 
     targetWasTouched = true;
@@ -501,7 +496,7 @@ export const performPendingDataMigrationRestoreSync = (
 
     const result: DataMigrationLastRestoreResult = {
       status: DataMigrationRestoreStatus.Success,
-      archivePath: request.archivePath,
+      archivePath,
       rollbackPath,
       restoredAt: now.toISOString(),
     };
@@ -515,7 +510,7 @@ export const performPendingDataMigrationRestoreSync = (
         // Leave the original error as the reported failure.
       }
     }
-    const result = buildFailedRestoreResult(request.archivePath, rollbackPath, error, now);
+    const result = buildFailedRestoreResult(archivePath, rollbackPath, error, now);
     try {
       writeRestoreResultSync(input.userDataPath, result);
     } catch {
@@ -527,4 +522,23 @@ export const performPendingDataMigrationRestoreSync = (
       removeDirIfExistsSync(extractedTempRoot);
     }
   }
+};
+
+export const performPendingDataMigrationRestoreSync = (
+  input: PerformPendingDataMigrationRestoreInput,
+): DataMigrationLastRestoreResult | null => {
+  const pendingPath = getPendingRestoreRequestPath(input.userDataPath);
+  const request = readJsonFileSync<PendingDataMigrationRestoreRequest>(pendingPath);
+  if (!request?.archivePath) return null;
+
+  try {
+    fs.unlinkSync(pendingPath);
+  } catch {
+    // The request has already been read; continue.
+  }
+
+  return performDataMigrationRestoreSync({
+    ...input,
+    archivePath: request.archivePath,
+  });
 };

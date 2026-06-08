@@ -65,6 +65,7 @@ import {
 import {
   DataMigrationIpc,
   type DataMigrationLastRestoreResult,
+  DataMigrationRestoreStatus,
 } from '../shared/dataMigration/constants';
 import { DialogIpc } from '../shared/dialog/constants';
 import {
@@ -181,8 +182,8 @@ import {
   createMigrationArchive,
   ensureTarGzFileName,
   inspectMigrationArchive,
+  performDataMigrationRestoreSync,
   performPendingDataMigrationRestoreSync,
-  writePendingRestoreRequestSync,
 } from './libs/dataMigration/dataMigrationService';
 import {
   getHtmlSharePublicBaseUrl,
@@ -4906,11 +4907,29 @@ if (!gotTheLock) {
 
       const archivePath = openResult.filePaths[0];
       await inspectMigrationArchive(archivePath);
-      writePendingRestoreRequestSync(app.getPath('userData'), archivePath);
-      app.relaunch();
-      app.quit();
-      return { success: true, scheduledRestart: true };
+      isCleanupInProgress = true;
+      isQuitting = true;
+      await runAppCleanup('data migration restore');
+      isCleanupFinished = true;
+      isCleanupInProgress = false;
+
+      const restoreResult = performDataMigrationRestoreSync({
+        userDataPath: app.getPath('userData'),
+        rollbackRootPath: path.join(app.getPath('appData'), `${APP_NAME}-migration-rollbacks`),
+        archivePath,
+      });
+      const success = restoreResult?.status === DataMigrationRestoreStatus.Success;
+      setTimeout(() => {
+        app.relaunch();
+        app.exit(0);
+      }, 100);
+      return {
+        success,
+        scheduledRestart: true,
+        error: success ? undefined : restoreResult?.error || 'Failed to import LobsterAI data backup',
+      };
     } catch (error) {
+      isCleanupInProgress = false;
       console.error('[DataMigration] restore scheduling failed:', error);
       return {
         success: false,
@@ -9024,8 +9043,8 @@ if (!gotTheLock) {
   let isCleanupFinished = false;
   let isCleanupInProgress = false;
 
-  const runAppCleanup = async (): Promise<void> => {
-    console.log('[Main] App is quitting, starting cleanup...');
+  const runAppCleanup = async (reason = 'quit'): Promise<void> => {
+    console.log(`[Main] App cleanup started for ${reason}`);
     destroyTray();
     skillManager?.stopWatching();
     stopMediaPollTimer();

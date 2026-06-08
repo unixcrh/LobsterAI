@@ -1982,6 +1982,7 @@ const Settings: React.FC<SettingsProps> = ({
     setError(null);
     setNoticeMessage(null);
     setIsRestoringOpenClawData(true);
+    let keepLoadingUntilRestart = false;
     try {
       await waitForNextPaint();
       const result = await window.electron.openclaw.dataMigration.restore();
@@ -1993,12 +1994,15 @@ const Settings: React.FC<SettingsProps> = ({
         return;
       }
       if (result.scheduledRestart) {
+        keepLoadingUntilRestart = true;
         setNoticeMessage(i18nService.t('openClawDataMigrationRestarting'));
       }
     } catch (restoreError) {
       setError(restoreError instanceof Error ? restoreError.message : i18nService.t('openClawDataMigrationFailed'));
     } finally {
-      setIsRestoringOpenClawData(false);
+      if (!keepLoadingUntilRestart) {
+        setIsRestoringOpenClawData(false);
+      }
     }
   }, [isRestoringOpenClawData]);
 
