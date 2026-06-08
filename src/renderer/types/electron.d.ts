@@ -200,6 +200,8 @@ interface OpenClawEngineStatus {
   version: string | null;
   progressPercent?: number;
   message?: string;
+  gatewayPort?: number | null;
+  gatewayHttpUrl?: string | null;
   canRetry: boolean;
 }
 

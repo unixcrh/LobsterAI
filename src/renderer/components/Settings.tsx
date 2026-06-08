@@ -38,6 +38,7 @@ import EmbeddingSettingsSection from './cowork/EmbeddingSettingsSection';
 import ErrorMessage from './ErrorMessage';
 import BrainIcon from './icons/BrainIcon';
 import EditIcon from './icons/EditIcon';
+import MessageCopyIcon from './icons/MessageCopyIcon';
 import PlugIcon from './icons/PlugIcon';
 import PlusCircleIcon from './icons/PlusCircleIcon';
 import IMSettings from './im/IMSettings';
@@ -739,6 +740,7 @@ const Settings: React.FC<SettingsProps> = ({
   const contentRef = useRef<HTMLDivElement>(null);
   const importInputRef = useRef<HTMLInputElement>(null);
   const emailCopiedTimerRef = useRef<number | null>(null);
+  const openClawGatewayCopiedTimerRef = useRef<number | null>(null);
   const updateCheckTimerRef = useRef<number | null>(null);
 
   // 快捷键设置
@@ -973,6 +975,7 @@ const Settings: React.FC<SettingsProps> = ({
   const [showOpenClawRepairConfirm, setShowOpenClawRepairConfirm] = useState<boolean>(false);
   const [isRepairingOpenClaw, setIsRepairingOpenClaw] = useState<boolean>(false);
   const [openClawRepairResult, setOpenClawRepairResult] = useState<OpenClawGatewayRepairResult | null>(null);
+  const [openClawGatewayCopied, setOpenClawGatewayCopied] = useState<boolean>(false);
 
   useEffect(() => {
     setCoworkAgentEngine(coworkConfig.agentEngine || 'openclaw');
@@ -1013,6 +1016,9 @@ const Settings: React.FC<SettingsProps> = ({
   useEffect(() => () => {
     if (emailCopiedTimerRef.current != null) {
       window.clearTimeout(emailCopiedTimerRef.current);
+    }
+    if (openClawGatewayCopiedTimerRef.current != null) {
+      window.clearTimeout(openClawGatewayCopiedTimerRef.current);
     }
     if (updateCheckTimerRef.current != null) {
       window.clearTimeout(updateCheckTimerRef.current);
@@ -1763,43 +1769,79 @@ const Settings: React.FC<SettingsProps> = ({
     if (phase === OpenClawEnginePhase.Error) {
       return {
         Icon: ExclamationTriangleIcon,
-        cardClassName: 'border-border bg-surface text-foreground',
         iconClassName: 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300',
         progressClassName: 'bg-red-500',
         spinIcon: false,
+        inProgress: false,
+        badgeLabelKey: 'openClawStatusBadgeError',
+        badgeClassName: 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300',
+        badgeDotClassName: 'bg-red-500',
       };
     }
 
     if (phase === OpenClawEnginePhase.Running || phase === OpenClawEnginePhase.Ready) {
       return {
         Icon: CheckCircleIcon,
-        cardClassName: 'border-border bg-surface text-foreground',
         iconClassName: 'bg-primary-muted text-primary',
         progressClassName: 'bg-primary',
         spinIcon: false,
+        inProgress: false,
+        badgeLabelKey: phase === OpenClawEnginePhase.Running
+          ? 'openClawStatusBadgeRunning'
+          : 'openClawStatusBadgeReady',
+        badgeClassName: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300',
+        badgeDotClassName: 'bg-emerald-500',
       };
     }
 
     if (phase === OpenClawEnginePhase.Installing || phase === OpenClawEnginePhase.Starting) {
       return {
         Icon: ArrowPathIcon,
-        cardClassName: 'border-border bg-surface text-foreground',
         iconClassName: 'bg-primary-muted text-primary',
         progressClassName: 'bg-primary',
         spinIcon: true,
+        inProgress: true,
+        badgeLabelKey: phase === OpenClawEnginePhase.Installing
+          ? 'openClawStatusBadgeInstalling'
+          : 'openClawStatusBadgeStarting',
+        badgeClassName: 'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300',
+        badgeDotClassName: 'bg-amber-500',
       };
     }
 
     return {
       Icon: CpuChipIcon,
-      cardClassName: 'border-border bg-surface text-foreground',
       iconClassName: 'bg-surface-raised text-secondary',
       progressClassName: 'bg-primary',
       spinIcon: false,
+      inProgress: false,
+      badgeLabelKey: 'openClawStatusBadgeNotInstalled',
+      badgeClassName: 'bg-surface-raised text-secondary',
+      badgeDotClassName: 'bg-secondary/60',
     };
   }, [openClawEngineStatus?.phase]);
 
   const OpenClawStatusIcon = openClawStatusTone.Icon;
+  const openClawGatewayHttpUrl = openClawEngineStatus?.gatewayHttpUrl?.trim() || null;
+
+  const handleCopyOpenClawGatewayUrl = useCallback(async () => {
+    if (!openClawGatewayHttpUrl) return;
+    const copied = await copyTextToClipboard(openClawGatewayHttpUrl);
+    if (!copied) return;
+
+    setOpenClawGatewayCopied(true);
+    if (openClawGatewayCopiedTimerRef.current != null) {
+      window.clearTimeout(openClawGatewayCopiedTimerRef.current);
+    }
+    openClawGatewayCopiedTimerRef.current = window.setTimeout(() => {
+      setOpenClawGatewayCopied(false);
+      openClawGatewayCopiedTimerRef.current = null;
+    }, 1200);
+  }, [openClawGatewayHttpUrl]);
+
+  useEffect(() => {
+    setOpenClawGatewayCopied(false);
+  }, [openClawGatewayHttpUrl]);
 
   const resolveOpenClawStatusText = (status: OpenClawEngineStatus | null): string => {
     if (!status) {
@@ -1821,6 +1863,10 @@ const Settings: React.FC<SettingsProps> = ({
       default:
         return status.message?.trim() || i18nService.t('coworkOpenClawRunning');
     }
+  };
+
+  const resolveOpenClawStatusDescription = (status: OpenClawEngineStatus | null): string => {
+    return status?.gatewayHttpUrl || i18nService.t('coworkOpenClawInstallHint');
   };
 
   const resolveOpenClawRepairMessage = (result: OpenClawGatewayRepairResult): string => {
@@ -3287,35 +3333,67 @@ const Settings: React.FC<SettingsProps> = ({
             {isOpenClawAgentEngine && (
               <>
                 <section className="space-y-3">
-                  <div className="flex items-center justify-between gap-4">
-                    <h4 className="min-w-0 flex-1 text-sm font-medium text-foreground">
-                      {i18nService.t('openClawRuntimeStatusTitle')}
-                    </h4>
-                    {openClawProgressPercent !== null && (
-                      <span className="shrink-0 rounded-full bg-surface-raised px-3 py-1 text-xs font-medium text-secondary">
-                        {openClawProgressPercent}%
-                      </span>
-                    )}
-                  </div>
+                  <h4 className="text-sm font-medium text-foreground">
+                    {i18nService.t('openClawRuntimeStatusTitle')}
+                  </h4>
 
-                  <div className={`rounded-xl border px-4 py-4 ${openClawStatusTone.cardClassName}`}>
-                    <div className="flex items-start gap-3">
-                      <span className={`inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg ${openClawStatusTone.iconClassName}`}>
-                        <OpenClawStatusIcon className={`h-4 w-4 ${openClawStatusTone.spinIcon ? 'animate-spin' : ''}`} />
+                  <div className="rounded-xl border border-border bg-surface p-4">
+                    <div className="flex items-start gap-3.5">
+                      <span className={`inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-xl ${openClawStatusTone.iconClassName}`}>
+                        <OpenClawStatusIcon className={`h-5 w-5 ${openClawStatusTone.spinIcon ? 'animate-spin' : ''}`} />
                       </span>
                       <div className="min-w-0 flex-1">
-                        <div className="text-sm font-medium leading-5 text-foreground">
-                          {resolveOpenClawStatusText(openClawEngineStatus)}
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="min-w-0 text-sm font-medium leading-5 text-foreground">
+                            {resolveOpenClawStatusText(openClawEngineStatus)}
+                          </div>
+                          <span className={`inline-flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium ${openClawStatusTone.badgeClassName}`}>
+                            <span className={`h-1.5 w-1.5 rounded-full ${openClawStatusTone.badgeDotClassName} ${openClawStatusTone.inProgress ? 'animate-pulse' : ''}`} />
+                            {i18nService.t(openClawStatusTone.badgeLabelKey)}
+                          </span>
                         </div>
-                        <p className="mt-2 text-sm text-secondary">
-                          {i18nService.t('coworkOpenClawInstallHint')}
-                        </p>
-                        {openClawProgressPercent !== null && (
-                          <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-surface-raised">
-                            <div
-                              className={`h-full rounded-full transition-all ${openClawStatusTone.progressClassName}`}
-                              style={{ width: `${openClawProgressPercent}%` }}
-                            />
+
+                        {openClawGatewayHttpUrl ? (
+                          <div className="mt-3 flex max-w-full items-center gap-2 rounded-lg border border-border-subtle bg-surface-raised/60 p-1.5">
+                            <span className="shrink-0 rounded-md bg-background px-2 py-1 text-[11px] font-medium text-secondary">
+                              {i18nService.t('openClawGatewayAddress')}
+                            </span>
+                            <code
+                              className="min-w-0 flex-1 select-all truncate px-1 font-mono text-[13px] leading-6 text-foreground"
+                              title={openClawGatewayHttpUrl}
+                            >
+                              {openClawGatewayHttpUrl}
+                            </code>
+                            <button
+                              type="button"
+                              onClick={handleCopyOpenClawGatewayUrl}
+                              title={openClawGatewayCopied ? i18nService.t('copied') : i18nService.t('copyToClipboard')}
+                              aria-label={openClawGatewayCopied ? i18nService.t('copied') : i18nService.t('copyToClipboard')}
+                              className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-secondary transition-colors hover:bg-background hover:text-primary focus:outline-none focus:ring-2 focus:ring-primary/25"
+                            >
+                              {openClawGatewayCopied
+                                ? <CheckCircleIcon className="h-4 w-4 text-primary" />
+                                : <MessageCopyIcon className="h-4 w-4" />}
+                            </button>
+                          </div>
+                        ) : (
+                          <p className="mt-2 text-sm text-secondary">
+                            {resolveOpenClawStatusDescription(openClawEngineStatus)}
+                          </p>
+                        )}
+
+                        {openClawStatusTone.inProgress && openClawProgressPercent !== null && (
+                          <div className="mt-3 space-y-1.5">
+                            <div className="flex items-center justify-between text-xs">
+                              <span className="text-secondary">{i18nService.t('openClawStartupProgressLabel')}</span>
+                              <span className="font-medium tabular-nums text-foreground">{openClawProgressPercent}%</span>
+                            </div>
+                            <div className="h-1.5 overflow-hidden rounded-full bg-surface-raised">
+                              <div
+                                className={`h-full rounded-full transition-all ${openClawStatusTone.progressClassName}`}
+                                style={{ width: `${openClawProgressPercent}%` }}
+                              />
+                            </div>
                           </div>
                         )}
                       </div>
@@ -3324,23 +3402,21 @@ const Settings: React.FC<SettingsProps> = ({
                 </section>
 
                 <section className="space-y-3">
-                  <div>
-                    <h4 className="text-sm font-medium text-foreground">
-                      {i18nService.t('openClawMaintenanceTitle')}
-                    </h4>
-                  </div>
+                  <h4 className="text-sm font-medium text-foreground">
+                    {i18nService.t('openClawMaintenanceTitle')}
+                  </h4>
 
-                  <div className="overflow-hidden rounded-xl border border-border bg-surface">
-                    <div className="flex flex-col gap-3 px-4 py-4 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="overflow-hidden rounded-xl border border-border bg-surface divide-y divide-border">
+                    <div className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between">
                       <div className="flex min-w-0 items-start gap-3">
-                        <span className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary-muted text-primary">
-                          <WrenchScrewdriverIcon className="h-4 w-4" />
+                        <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary-muted text-primary">
+                          <WrenchScrewdriverIcon className="h-[18px] w-[18px]" />
                         </span>
                         <div className="min-w-0">
                           <div className="text-sm font-medium text-foreground">
                             {i18nService.t('openClawRepairGatewayStateTitle')}
                           </div>
-                          <div className="mt-1 text-sm text-secondary">
+                          <div className="mt-0.5 text-[13px] leading-5 text-secondary">
                             {i18nService.t('openClawRepairGatewayStateDesc')}
                           </div>
                         </div>
@@ -3349,12 +3425,10 @@ const Settings: React.FC<SettingsProps> = ({
                         type="button"
                         onClick={() => setShowOpenClawRepairConfirm(true)}
                         disabled={isRepairingOpenClaw}
-                        className="inline-flex h-8 shrink-0 items-center justify-center gap-2 rounded-lg bg-primary px-3 text-xs font-medium text-white transition-colors hover:bg-primary-hover disabled:cursor-not-allowed disabled:opacity-60 active:scale-[0.98]"
+                        className="inline-flex h-8 shrink-0 items-center justify-center gap-1.5 self-start rounded-lg border border-border bg-surface px-3 text-xs font-medium text-foreground transition-colors hover:bg-surface-raised disabled:cursor-not-allowed disabled:opacity-60 active:scale-[0.98] sm:self-auto"
                       >
-                        {isRepairingOpenClaw ? (
+                        {isRepairingOpenClaw && (
                           <ArrowPathIcon className="h-3.5 w-3.5 animate-spin" />
-                        ) : (
-                          <WrenchScrewdriverIcon className="h-3.5 w-3.5" />
                         )}
                         {isRepairingOpenClaw
                           ? i18nService.t('openClawRepairRunning')
@@ -3362,46 +3436,42 @@ const Settings: React.FC<SettingsProps> = ({
                       </button>
                     </div>
 
-                    <div className="border-t border-border px-4 py-4">
-                      <div className="flex items-start justify-between gap-3">
-                        <div className="flex min-w-0 items-start gap-3">
-                          <span className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-surface-raised text-secondary">
-                            <ArchiveBoxIcon className="h-4 w-4" />
-                          </span>
-                          <div className="min-w-0">
-                            <div className="text-sm font-medium text-foreground">
-                              {i18nService.t('openClawDataBackupTitle')}
-                            </div>
-                            <div className="mt-1 text-sm text-secondary">
-                              {i18nService.t('openClawDataBackupDesc')}
-                            </div>
+                    <div className="flex items-start justify-between gap-3 p-4 opacity-70">
+                      <div className="flex min-w-0 items-start gap-3">
+                        <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-surface-raised text-secondary/70">
+                          <ArchiveBoxIcon className="h-[18px] w-[18px]" />
+                        </span>
+                        <div className="min-w-0">
+                          <div className="text-sm font-medium text-secondary">
+                            {i18nService.t('openClawDataBackupTitle')}
+                          </div>
+                          <div className="mt-0.5 text-[13px] leading-5 text-secondary">
+                            {i18nService.t('openClawDataBackupDesc')}
                           </div>
                         </div>
-                        <span className="shrink-0 rounded-full bg-surface-raised px-3 py-1 text-xs font-medium text-secondary">
-                          {i18nService.t('openClawMaintenanceComingSoon')}
-                        </span>
                       </div>
+                      <span className="shrink-0 self-center rounded-full border border-border-subtle bg-surface-raised px-2.5 py-1 text-xs font-medium text-secondary">
+                        {i18nService.t('openClawMaintenanceComingSoon')}
+                      </span>
                     </div>
 
-                    <div className="border-t border-border px-4 py-4">
-                      <div className="flex items-start justify-between gap-3">
-                        <div className="flex min-w-0 items-start gap-3">
-                          <span className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-surface-raised text-secondary">
-                            <ArrowPathRoundedSquareIcon className="h-4 w-4" />
-                          </span>
-                          <div className="min-w-0">
-                            <div className="text-sm font-medium text-foreground">
-                              {i18nService.t('openClawDataMigrationTitle')}
-                            </div>
-                            <div className="mt-1 text-sm text-secondary">
-                              {i18nService.t('openClawDataMigrationDesc')}
-                            </div>
+                    <div className="flex items-start justify-between gap-3 p-4 opacity-70">
+                      <div className="flex min-w-0 items-start gap-3">
+                        <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-surface-raised text-secondary/70">
+                          <ArrowPathRoundedSquareIcon className="h-[18px] w-[18px]" />
+                        </span>
+                        <div className="min-w-0">
+                          <div className="text-sm font-medium text-secondary">
+                            {i18nService.t('openClawDataMigrationTitle')}
+                          </div>
+                          <div className="mt-0.5 text-[13px] leading-5 text-secondary">
+                            {i18nService.t('openClawDataMigrationDesc')}
                           </div>
                         </div>
-                        <span className="shrink-0 rounded-full bg-surface-raised px-3 py-1 text-xs font-medium text-secondary">
-                          {i18nService.t('openClawMaintenanceComingSoon')}
-                        </span>
                       </div>
+                      <span className="shrink-0 self-center rounded-full border border-border-subtle bg-surface-raised px-2.5 py-1 text-xs font-medium text-secondary">
+                        {i18nService.t('openClawMaintenanceComingSoon')}
+                      </span>
                     </div>
                   </div>
                 </section>
