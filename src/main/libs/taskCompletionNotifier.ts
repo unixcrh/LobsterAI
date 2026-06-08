@@ -1,21 +1,21 @@
-import { app, BrowserWindow, Notification } from 'electron';
+import { app, BrowserWindow, nativeImage, Notification } from 'electron';
 
 import {
   normalizeNotificationSettings,
   type NotificationSettings,
 } from '../../shared/notifications/constants';
+import { APP_ATTENTION_BADGE_COLOR } from '../appConstants';
 import { t } from '../i18n';
 
 interface PendingCompletionNotification {
   sessionId: string;
-  title: string;
   completedAt: number;
 }
 
 interface TaskCompletionNotifierOptions {
   getWindow: () => BrowserWindow | null;
+  getNotificationIconPath: () => string | null;
   getNotificationSettings: () => Partial<NotificationSettings> | undefined;
-  getSessionTitle: (sessionId: string) => string | null;
   focusMainWindow: (reason: string) => void;
   openSession: (sessionId: string) => void;
   updateTrayReminder: (count: number, onClick?: () => void) => void;
@@ -23,6 +23,7 @@ interface TaskCompletionNotifierOptions {
 
 export class TaskCompletionNotifier {
   private pendingCompletions = new Map<string, PendingCompletionNotification>();
+  private windowsOverlayIcons = new Map<string, Electron.NativeImage>();
 
   constructor(private readonly options: TaskCompletionNotifierOptions) {}
 
@@ -44,10 +45,8 @@ export class TaskCompletionNotifier {
       return;
     }
 
-    const title = this.options.getSessionTitle(sessionId) || t('coworkDefaultSessionTitle');
     this.pendingCompletions.set(sessionId, {
       sessionId,
-      title,
       completedAt: Date.now(),
     });
     console.log(
@@ -55,7 +54,7 @@ export class TaskCompletionNotifier {
     );
 
     this.updateAttentionState();
-    this.showSystemNotification(sessionId, title);
+    this.showSystemNotification(sessionId);
   }
 
   markSessionViewed(sessionId: string): void {
@@ -86,7 +85,7 @@ export class TaskCompletionNotifier {
     return !!win && !win.isDestroyed() && win.isVisible() && !win.isMinimized() && win.isFocused();
   }
 
-  private showSystemNotification(sessionId: string, title: string): void {
+  private showSystemNotification(sessionId: string): void {
     if (!Notification.isSupported()) {
       console.warn('[TaskCompletionNotifier] system notifications are not supported on this platform');
       return;
@@ -95,7 +94,8 @@ export class TaskCompletionNotifier {
     try {
       const notification = new Notification({
         title: t('taskCompletionNotificationTitle'),
-        body: t('taskCompletionNotificationBody', { title }),
+        body: t('taskCompletionNotificationBody'),
+        icon: this.getNotificationIcon(),
       });
       notification.on('click', () => {
         console.log(`[TaskCompletionNotifier] system notification clicked for session ${sessionId}`);
@@ -109,11 +109,12 @@ export class TaskCompletionNotifier {
 
   private updateAttentionState(): void {
     const count = this.pendingCompletions.size;
+    const hasReminder = count > 0;
     this.updateDockBadge(count);
     this.updateWindowsAttention(count);
     this.options.updateTrayReminder(
       count,
-      count > 0 ? () => this.openPendingSession(this.getMostRecentPendingSessionId()) : undefined,
+      hasReminder ? () => this.openPendingSession(this.getMostRecentPendingSessionId()) : undefined,
     );
   }
 
@@ -122,7 +123,7 @@ export class TaskCompletionNotifier {
     try {
       app.dock.setBadge(count > 0 ? String(count) : '');
     } catch (error) {
-      console.warn('[TaskCompletionNotifier] failed to update dock badge:', error);
+      console.warn('[TaskCompletionNotifier] failed to update Dock badge:', error);
     }
   }
 
@@ -130,11 +131,45 @@ export class TaskCompletionNotifier {
     if (process.platform !== 'win32') return;
     const win = this.options.getWindow();
     if (!win || win.isDestroyed()) return;
+    const hasReminder = count > 0;
     try {
-      win.flashFrame(count > 0);
+      win.setOverlayIcon(
+        hasReminder ? this.getWindowsOverlayIcon(count) : null,
+        hasReminder ? t('taskCompletionOverlayDescription') : '',
+      );
+      win.flashFrame(hasReminder);
     } catch (error) {
       console.warn('[TaskCompletionNotifier] failed to update Windows taskbar attention state:', error);
     }
+  }
+
+  private getNotificationIcon(): Electron.NativeImage | undefined {
+    const iconPath = this.options.getNotificationIconPath();
+    if (!iconPath) return undefined;
+    const image = nativeImage.createFromPath(iconPath);
+    return image.isEmpty() ? undefined : image;
+  }
+
+  private getWindowsOverlayIcon(count: number): Electron.NativeImage {
+    const label = this.formatBadgeCount(count);
+    const cachedIcon = this.windowsOverlayIcons.get(label);
+    if (cachedIcon && !cachedIcon.isEmpty()) return cachedIcon;
+
+    const svg = [
+      '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">',
+      `<circle cx="16" cy="16" r="15" fill="${APP_ATTENTION_BADGE_COLOR}"/>`,
+      `<text x="16" y="21" text-anchor="middle" fill="#ffffff" font-size="${label.length > 2 ? 12 : 18}" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-weight="600">${label}</text>`,
+      '</svg>',
+    ].join('');
+    const icon = nativeImage.createFromDataURL(
+      `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`,
+    );
+    this.windowsOverlayIcons.set(label, icon);
+    return icon;
+  }
+
+  private formatBadgeCount(count: number): string {
+    return count > 99 ? '99+' : String(count);
   }
 
   private getMostRecentPendingSessionId(): string {

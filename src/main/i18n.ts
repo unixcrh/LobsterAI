@@ -24,7 +24,8 @@ const translations: Record<LanguageType, Record<string, string>> = {
     traySettings: '设置',
     trayQuit: '退出',
     taskCompletionNotificationTitle: '任务已完成',
-    taskCompletionNotificationBody: '{title} 已完成',
+    taskCompletionNotificationBody: '有任务已完成，点击查看结果',
+    taskCompletionOverlayDescription: '有任务已完成',
 
     // Session titles (created by ChannelSessionSync)
     coworkDefaultSessionTitle: '新对话',
@@ -283,7 +284,8 @@ const translations: Record<LanguageType, Record<string, string>> = {
     traySettings: 'Settings',
     trayQuit: 'Quit',
     taskCompletionNotificationTitle: 'Task Complete',
-    taskCompletionNotificationBody: '{title} is complete',
+    taskCompletionNotificationBody: 'A task has finished. Click to view the result.',
+    taskCompletionOverlayDescription: 'Task complete',
 
     // Session titles
     coworkDefaultSessionTitle: 'New Chat',

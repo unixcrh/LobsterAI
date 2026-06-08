@@ -92,7 +92,7 @@ import { ProviderName } from '../shared/providers';
 import type { ShellOpenFailureReason as ShellOpenFailureReasonType } from '../shared/shell/constants';
 import { ShellOpenFailureReason } from '../shared/shell/constants';
 import { AgentManager } from './agentManager';
-import { APP_NAME } from './appConstants';
+import { APP_NAME, APP_USER_MODEL_ID } from './appConstants';
 import { authQuotaGateStateFromQuota, AuthSubscriptionStatus, createDefaultAuthQuotaGateState, normalizeAuthQuota } from './authQuota';
 import { getAutoLaunchEnabled, isAutoLaunched, setAutoLaunchEnabled } from './autoLaunchManager';
 import { type CoworkForkContextMessage, type CoworkMessage, CoworkStore } from './coworkStore';
@@ -309,9 +309,12 @@ const gwDiagTs = (): string => {
   return `[GW-RESTART-DIAG] ${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}${sign}${p(Math.floor(abs / 60))}:${p(abs % 60)}`;
 };
 
-// 设置应用程序名称
+// Configure the app identity before any OS-level surfaces are created.
 app.name = APP_NAME;
 app.setName(APP_NAME);
+if (process.platform === 'win32') {
+  app.setAppUserModelId(APP_USER_MODEL_ID);
+}
 
 const INVALID_FILE_NAME_PATTERN = /[<>:"/\\|?*\u0000-\u001F]/g;
 const MIN_MEMORY_USER_MEMORIES_MAX_ITEMS = 1;
@@ -2258,10 +2261,9 @@ const getTaskCompletionNotifier = (): TaskCompletionNotifier => {
   if (!taskCompletionNotifier) {
     taskCompletionNotifier = new TaskCompletionNotifier({
       getWindow: () => mainWindow,
+      getNotificationIconPath,
       getNotificationSettings: () =>
         getStore().get<AppConfigSettings>('app_config')?.notificationSettings,
-      getSessionTitle: (sessionId: string) =>
-        getCoworkStore().getSession(sessionId, 0)?.title?.trim() || null,
       focusMainWindow: focusMainWindowForReason,
       openSession: (sessionId: string) => {
         if (!mainWindow || mainWindow.isDestroyed()) return;
@@ -2606,6 +2608,19 @@ const getAppIconPath = (): string | undefined => {
   return process.platform === 'win32'
     ? path.join(basePath, 'tray-icon.ico')
     : path.join(basePath, 'tray-icon.png');
+};
+
+const getNotificationIconPath = (): string | null => {
+  const candidates = app.isPackaged
+    ? [
+        path.join(process.resourcesPath, 'app-icon/512x512.png'),
+        path.join(process.resourcesPath, 'icon.icns'),
+      ]
+    : [
+        path.join(__dirname, 'build/icons/png/512x512.png'),
+        path.join(__dirname, '../build/icons/png/512x512.png'),
+      ];
+  return candidates.find(candidate => fs.existsSync(candidate)) ?? null;
 };
 
 // 保存对主窗口的引用
@@ -8752,8 +8767,8 @@ if (!gotTheLock) {
 
     // 设置 macOS Dock 图标（开发模式下 Electron 默认图标不是应用 Logo）
     if (isMac && isDev) {
-      const iconPath = path.join(__dirname, '../build/icons/png/512x512.png');
-      if (fs.existsSync(iconPath)) {
+      const iconPath = getNotificationIconPath();
+      if (iconPath) {
         app.dock.setIcon(nativeImage.createFromPath(iconPath));
       }
     }
@@ -8852,6 +8867,10 @@ if (!gotTheLock) {
         e.preventDefault();
         mainWindow.hide();
       }
+    });
+
+    mainWindow.on('focus', () => {
+      getTaskCompletionNotifier().clearAll('main window focused');
     });
 
     // 处理渲染进程崩溃或退出
